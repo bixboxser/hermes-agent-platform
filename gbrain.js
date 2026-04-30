@@ -29,6 +29,12 @@ async function ensureGBrainSchema() {
       state text,
       updated_at timestamptz default now()
     );
+
+    alter table hermes_tasks
+      add column if not exists issue_url text;
+
+    alter table hermes_tasks
+      add column if not exists issue_number bigint;
   `);
 
 }

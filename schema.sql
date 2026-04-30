@@ -15,6 +15,8 @@ create table if not exists hermes_tasks (
   status text not null default 'pending',
   result_text text,
   error_text text,
+  issue_url text,
+  issue_number bigint,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
