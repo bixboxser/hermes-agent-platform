@@ -113,6 +113,75 @@ Create a pull request with implementation.`;
   };
 }
 
+
+async function createIssueComment(taskId, issueNumber, body) {
+  const token = process.env.GITHUB_TOKEN;
+  const owner = process.env.GITHUB_OWNER;
+  const repo = process.env.GITHUB_REPO;
+
+  if (!token || !owner || !repo) {
+    throw new Error("Missing GitHub env: GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO");
+  }
+
+  try {
+    const res = await axios.post(
+    `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}/comments`,
+    { body },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    }
+  );
+
+    return {
+      commentUrl: res.data.html_url,
+    };
+  } catch (err) {
+    const errMsg = err.response?.data?.message || err.message;
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload)
+       values ($1, 'codex_trigger_failed', $2, $3)`,
+      [taskId, "Failed to add Codex trigger comment", { error: errMsg }]
+    );
+    throw err;
+  }
+}
+
+async function findLinkedPullRequest(issueNumber) {
+  const token = process.env.GITHUB_TOKEN;
+  const owner = process.env.GITHUB_OWNER;
+  const repo = process.env.GITHUB_REPO;
+
+  if (!token || !owner || !repo) {
+    throw new Error("Missing GitHub env: GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO");
+  }
+
+  const res = await axios.get(
+    `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}/timeline`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    }
+  );
+
+  const linked = (res.data || []).find(
+    (e) => e.event === "cross-referenced" && e.source?.issue?.pull_request?.html_url
+  );
+
+  if (!linked) return null;
+
+  return {
+    pullRequestUrl: linked.source.issue.pull_request.html_url,
+    pullRequestNumber: linked.source.issue.number,
+  };
+}
+
 async function buildDailyReport() {
   let memoryCount = 0;
   try {
@@ -453,25 +522,45 @@ async function createCodeAgentTask(chatId, userId, taskText) {
 
   try {
     const { issueUrl, issueNumber } = await createGithubIssue(taskText);
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload)
+       values ($1, 'github_issue_created', $2, $3)`,
+      [taskId, `Issue #${issueNumber} created`, { issue_url: issueUrl, issue_number: issueNumber }]
+    );
+
+    const triggerText = "@codex implement this issue exactly. Create a pull request. Do not modify unrelated files.";
+    let codexTriggerOk = false;
+    let codexTriggerError = null;
+    let codexTriggerCommentUrl = null;
+
+    try {
+      const comment = await createIssueComment(taskId, issueNumber, triggerText);
+      codexTriggerOk = true;
+      codexTriggerCommentUrl = comment.commentUrl;
+
+      await query(
+        `insert into hermes_task_events (task_id, event_type, message, payload)
+         values ($1, 'codex_triggered', $2, $3)`,
+        [taskId, `Codex trigger comment added on issue #${issueNumber}`, { comment_url: comment.commentUrl }]
+      );
+    } catch (err) {
+      codexTriggerError = err.response?.data?.message || err.message;
+    }
 
     await query(
       `update hermes_tasks
        set status = 'completed',
            issue_url = $1,
            issue_number = $2,
-           result_text = $3,
+           codex_triggered_at = case when $3 then now() else null end,
+           codex_trigger_comment_url = $4,
+           result_text = $5,
            updated_at = now()
-       where id = $4`,
-      [issueUrl, issueNumber, `GitHub issue created: ${issueUrl}`, taskId]
+       where id = $6`,
+      [issueUrl, issueNumber, codexTriggerOk, codexTriggerCommentUrl, `GitHub issue created: ${issueUrl}`, taskId]
     );
 
-    await query(
-      `insert into hermes_task_events (task_id, event_type, message, payload)
-       values ($1, 'code_issue_created', $2, $3)`,
-      [taskId, `Issue #${issueNumber} created`, { issue_url: issueUrl, issue_number: issueNumber }]
-    );
-
-    return { duplicate: false, issueUrl, issueNumber };
+    return { duplicate: false, issueUrl, issueNumber, taskId, codexTriggerOk, codexTriggerError };
   } catch (err) {
     const errorText = err.response?.data ? JSON.stringify(err.response.data) : err.message;
 
@@ -492,6 +581,51 @@ async function createCodeAgentTask(chatId, userId, taskText) {
 
     throw err;
   }
+}
+
+async function checkAndStorePullRequest(taskId) {
+  const taskRes = await query(
+    `select id, issue_number, pull_request_url, pull_request_number from hermes_tasks where id = $1 limit 1`,
+    [taskId]
+  );
+
+  const task = taskRes.rows[0];
+  if (!task) {
+    throw new Error("Task không tồn tại.");
+  }
+
+  if (!task.issue_number) {
+    throw new Error("Task chưa có GitHub Issue.");
+  }
+
+  const linked = await findLinkedPullRequest(task.issue_number);
+
+  if (!linked) {
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload)
+       values ($1, 'pull_request_not_found', $2, $3)`,
+      [taskId, `No linked PR found for issue #${task.issue_number}`, { issue_number: task.issue_number }]
+    );
+    return null;
+  }
+
+  await query(
+    `update hermes_tasks
+     set pull_request_url = $1,
+         pull_request_number = $2,
+         pull_request_detected_at = now(),
+         updated_at = now()
+     where id = $3`,
+    [linked.pullRequestUrl, linked.pullRequestNumber, taskId]
+  );
+
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message, payload)
+     values ($1, 'pull_request_detected', $2, $3)`,
+    [taskId, `Linked PR #${linked.pullRequestNumber} detected`, { pull_request_url: linked.pullRequestUrl, pull_request_number: linked.pullRequestNumber }]
+  );
+
+  return linked;
 }
 
 app.get("/", (req, res) => {
@@ -1142,10 +1276,39 @@ if (text.startsWith("/code")) {
     if (result.duplicate) {
       await sendTelegramMessage(chatId, `Issue đã tồn tại cho task này: ${result.issueUrl}`);
     } else {
-      await sendTelegramMessage(chatId, `✅ Đã tạo GitHub Issue #${result.issueNumber}:\n${result.issueUrl}`);
+      const triggerLine = result.codexTriggerOk
+        ? "Codex trigger: ✅ thành công"
+        : `Codex trigger: ❌ thất bại (${result.codexTriggerError || "unknown error"})`;
+      await sendTelegramMessage(
+        chatId,
+        `✅ Đã tạo GitHub Issue #${result.issueNumber}:\n${result.issueUrl}\n${triggerLine}`
+      );
     }
   } catch (err) {
     await sendTelegramMessage(chatId, `Lỗi /code: ${err.message}`);
+  }
+
+  continue;
+}
+
+
+if (text.startsWith("/pr")) {
+  const input = text.replace("/pr", "").trim();
+
+  if (!input || Number.isNaN(Number(input))) {
+    await sendTelegramMessage(chatId, "Bạn cần nhập task_id hợp lệ sau /pr. Ví dụ: /pr 123");
+    continue;
+  }
+
+  try {
+    const pr = await checkAndStorePullRequest(Number(input));
+    if (!pr) {
+      await sendTelegramMessage(chatId, `Chưa tìm thấy PR linked cho task #${input}.`);
+    } else {
+      await sendTelegramMessage(chatId, `✅ Đã tìm thấy PR #${pr.pullRequestNumber}:\n${pr.pullRequestUrl}`);
+    }
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /pr: ${err.message}`);
   }
 
   continue;

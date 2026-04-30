@@ -36,6 +36,21 @@ async function ensureGBrainSchema() {
     alter table hermes_tasks
       add column if not exists issue_number bigint;
 
+    alter table hermes_tasks
+      add column if not exists codex_triggered_at timestamptz;
+
+    alter table hermes_tasks
+      add column if not exists codex_trigger_comment_url text;
+
+    alter table hermes_tasks
+      add column if not exists pull_request_url text;
+
+    alter table hermes_tasks
+      add column if not exists pull_request_number bigint;
+
+    alter table hermes_tasks
+      add column if not exists pull_request_detected_at timestamptz;
+
     alter table hermes_approvals
       add column if not exists executed_at timestamptz;
   `);
