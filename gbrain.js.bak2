@@ -1,0 +1,129 @@
+const axios = require("axios");
+const { query } = require("./db");
+
+async function ensureGBrainSchema() {
+  await query(`
+    create table if not exists gbrain_memories (
+      id bigserial primary key,
+      category text not null,
+      title text not null,
+      summary text not null,
+      lesson text,
+      tags text[] not null default '{}',
+      confidence text not null default 'medium',
+      source text not null default 'hermes',
+      created_at timestamptz not null default now()
+    );
+
+    create index if not exists gbrain_memories_category_idx
+      on gbrain_memories(category);
+
+    create index if not exists gbrain_memories_created_at_idx
+      on gbrain_memories(created_at desc);
+  `);
+}
+
+function cleanJson(text) {
+  return String(text || "")
+    .trim()
+    .replace(/^```json/i, "")
+    .replace(/^```/i, "")
+    .replace(/```$/i, "")
+    .trim();
+}
+
+async function callDeepSeek(prompt) {
+  if (!process.env.DEEPSEEK_API_KEY) {
+    throw new Error("Missing DEEPSEEK_API_KEY");
+  }
+
+  const res = await axios.post(
+    "https://api.deepseek.com/chat/completions",
+    {
+      model: process.env.DEEPSEEK_MODEL || "deepseek-chat",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+    },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      },
+    }
+  );
+
+  return res.data?.choices?.[0]?.message?.content || "";
+}
+
+async function learnFromText(input, source = "telegram") {
+  const prompt = `
+Bạn là Hermes Learn Engine.
+
+Rút ra 1 memory có thể tái sử dụng từ nội dung sau.
+
+Chỉ trả JSON, không giải thích:
+{
+  "category": "known_bug | coding_rule | deployment_rule | ops_sop | content_style | project_context",
+  "title": "...",
+  "summary": "...",
+  "lesson": "...",
+  "tags": ["..."],
+  "confidence": "low | medium | high"
+}
+
+Quy tắc:
+- Chỉ lưu bài học dùng lại được.
+- Không lưu noise tạm thời.
+- Title ngắn.
+- Lesson phải actionable.
+- Tiếng Việt được phép.
+
+Nội dung:
+${input}
+`;
+
+  const raw = await callDeepSeek(prompt);
+  const memory = JSON.parse(cleanJson(raw));
+
+  const result = await query(
+    `insert into gbrain_memories
+      (category, title, summary, lesson, tags, confidence, source)
+     values ($1, $2, $3, $4, $5, $6, $7)
+     returning *`,
+    [
+      memory.category || "project_context",
+      memory.title,
+      memory.summary,
+      memory.lesson || null,
+      memory.tags || [],
+      memory.confidence || "medium",
+      source,
+    ]
+  );
+
+  return result.rows[0];
+}
+
+async function recallMemories(searchText) {
+  const q = `%${searchText}%`;
+
+  const result = await query(
+    `select *
+     from gbrain_memories
+     where title ilike $1
+        or summary ilike $1
+        or lesson ilike $1
+        or array_to_string(tags, ',') ilike $1
+     order by created_at desc
+     limit 8`,
+    [q]
+  );
+
+  return result.rows;
+}
+
+module.exports = {
+  ensureGBrainSchema,
+  learnFromText,
+  recallMemories,
+};

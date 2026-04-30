@@ -1,0 +1,129 @@
+const express = require("express");
+const axios = require("axios");
+const { query } = require("./db");
+
+const app = express();
+app.use(express.json());
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+const ALLOWED_USER_IDS = String(process.env.ALLOWED_USER_IDS || "")
+  .split(",")
+  .map((id) => Number(id.trim()))
+  .filter(Boolean);
+
+let offset = 0;
+
+async function sendTelegramMessage(chatId, text) {
+  await axios.post(`${TELEGRAM_API}/sendMessage`, {
+    chat_id: chatId,
+    text,
+  });
+}
+
+function isAllowed(userId) {
+  return ALLOWED_USER_IDS.includes(Number(userId));
+}
+
+async function createTask(chatId, userId, text) {
+  const result = await query(
+    `insert into hermes_tasks (telegram_chat_id, telegram_user_id, input_text, status)
+     values ($1, $2, $3, 'pending')
+     returning id`,
+    [chatId, userId, text]
+  );
+
+  const taskId = result.rows[0].id;
+
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message)
+     values ($1, 'created', $2)`,
+    [taskId, "Task created from Telegram"]
+  );
+
+  return taskId;
+}
+
+app.get("/", (req, res) => {
+  res.send("Hermes v5 Lite App Running 🚀");
+});
+
+async function pollTelegram() {
+  try {
+    const { data } = await axios.get(`${TELEGRAM_API}/getUpdates`, {
+      params: { offset, timeout: 10 },
+    });
+
+    for (const update of data.result || []) {
+      offset = update.update_id + 1;
+      
+      const callback = update.callback_query;
+
+if (callback) {
+  const data = callback.data;
+  const chatId = callback.message.chat.id;
+
+  if (data.startsWith("approve_")) {
+    const taskId = data.split("_")[1];
+
+    await sendTelegramMessage(chatId, `Đã duyệt task ${taskId}`);
+
+    await handleAction(`duyệt task ${taskId}`, chatId);
+  }
+
+  if (data.startsWith("reject_")) {
+    const taskId = data.split("_")[1];
+
+    await sendTelegramMessage(chatId, `Đã từ chối task ${taskId}`);
+  }
+
+  continue;
+} 
+       
+      const message = update.message;
+      if (!message?.text) continue;
+
+      const chatId = message.chat.id;
+      const userId = message.from.id;
+      const text = message.text.trim();
+
+      console.log("INCOMING:", { userId, text });
+
+      await query(
+        `insert into telegram_users (telegram_user_id, is_allowed)
+         values ($1, $2)
+         on conflict (telegram_user_id)
+         do update set last_seen_at = now()`,
+        [userId, isAllowed(userId)]
+      );
+
+      if (text === "/id") {
+        await sendTelegramMessage(chatId, `Telegram user_id của bạn là: ${userId}`);
+        continue;
+      }
+
+      if (!isAllowed(userId)) {
+        await sendTelegramMessage(chatId, "Bạn không có quyền sử dụng Hermes.");
+        continue;
+      }
+
+      if (text === "/health") {
+        await sendTelegramMessage(chatId, "Hermes app online ✅\nWorker sẽ xử lý task trong nền.");
+        continue;
+      }
+
+      const taskId = await createTask(chatId, userId, text);
+      await sendTelegramMessage(chatId, `Đã nhận task #${taskId}. Hermes đang xử lý...`);
+    }
+  } catch (err) {
+    console.error("Polling error:", err.response?.data || err.message);
+  }
+
+  setTimeout(pollTelegram, 1000);
+}
+
+pollTelegram();
+
+app.listen(3000, () => {
+  console.log("Hermes app running on port 3000");
+});

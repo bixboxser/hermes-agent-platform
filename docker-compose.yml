@@ -1,0 +1,66 @@
+services:
+  app:
+    image: node:20-bullseye
+    container_name: hermes_app
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /root/projects:/root/projects
+    env_file:
+      - .env
+    environment:
+      - GIT_AUTHOR_NAME=Mason
+      - GIT_AUTHOR_EMAIL=nguyenminhquanlcdn@gmail.com
+      - GIT_COMMITTER_NAME=Mason
+      - GIT_COMMITTER_EMAIL=nguyenminhquanlcdn@gmail.com
+      - DEEPSEEK_API_KEY=sk-7ab015abefc54c9da4f03a5c8d0b18e9
+      - DEEPSEEK_MODEL=deepseek-v4-pro
+      - OPENAI_API_KEY=dummy_key
+      - OWNER_CHAT_ID=7187574836
+      - AUTO_DAILY_ENABLED=true
+      - AUTO_WEEKLY_ENABLED=true
+    command: node index.js
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  worker:
+    image: node:20-bullseye
+    container_name: hermes_worker
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /root/projects:/root/projects
+    env_file:
+      - .env
+    environment:
+      - GIT_AUTHOR_NAME=Mason
+      - GIT_AUTHOR_EMAIL=nguyenminhquanlcdn@gmail.com
+      - GIT_COMMITTER_NAME=Mason
+      - GIT_COMMITTER_EMAIL=nguyenminhquanlcdn@gmail.com
+      - DEEPSEEK_API_KEY=sk-7ab015abefc54c9da4f03a5c8d0b18e9
+      - DEEPSEEK_MODEL=deepseek-v4-pro
+      - OPENAI_API_KEY=dummy_key
+      - OWNER_CHAT_ID=7187574836
+      - AUTO_DAILY_ENABLED=true
+      - AUTO_WEEKLY_ENABLED=true
+    command: node worker.js
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    container_name: hermes_db
+    environment:
+      POSTGRES_USER: hermes
+      POSTGRES_PASSWORD: hermes_password
+      POSTGRES_DB: hermes
+    volumes:
+      - hermes_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  hermes_pgdata:

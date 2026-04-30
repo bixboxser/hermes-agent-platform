@@ -1,0 +1,1289 @@
+const express = require("express");
+const axios = require("axios");
+const { query } = require("./db");
+const {
+  ensureGBrainSchema,
+  learnFromText,
+  recallMemories,
+  runDispatcher,
+  buildCodexPrompt,
+  reviewCodexResult,
+  buildAudit,
+  buildDeployCheck,
+} = require("./gbrain");
+const app = express();
+app.use(express.json());
+
+const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
+const AUTO_DAILY_ENABLED = process.env.AUTO_DAILY_ENABLED === "true";
+const AUTO_WEEKLY_ENABLED = process.env.AUTO_WEEKLY_ENABLED === "true";
+
+let lastDailyKey = null;
+let lastWeeklyKey = null;
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+const ALLOWED_USER_IDS = String(process.env.ALLOWED_USER_IDS || "")
+  .split(",")
+  .map((id) => Number(id.trim()))
+  .filter(Boolean);
+
+let offset = 0;
+
+const { exec } = require("child_process");
+
+function execAsync(cmd) {
+  return new Promise((resolve) => {
+    exec(cmd, { timeout: 8000 }, (error, stdout, stderr) => {
+      resolve({
+        ok: !error,
+        stdout: (stdout || "").toString(),
+        stderr: (stderr || "").toString(),
+      });
+    });
+  });
+}
+
+async function sendTelegramMessage(chatId, text, extra ={}) {
+  await axios.post(`${TELEGRAM_API}/sendMessage`, {
+    chat_id: chatId,
+    text,
+    ...extra,
+  });
+}
+
+async function buildDailyReport() {
+  let memoryCount = 0;
+  try {
+    const mem = await query(`select count(*)::int as c from gbrain_memories`);
+    memoryCount = mem.rows[0]?.c || 0;
+  } catch {}
+
+  let activeSessions = 0;
+  try {
+    const s = await query(
+      `select count(*)::int as c from hermes_sessions where state is not null`
+    );
+    activeSessions = s.rows[0]?.c || 0;
+  } catch {}
+
+  let recentTasks = [];
+  try {
+    const t = await query(
+      `select id, status, input_text, created_at
+       from hermes_tasks
+       order by created_at desc
+       limit 5`
+    );
+    recentTasks = t.rows || [];
+  } catch {}
+
+  const grouped = {};
+  for (const t of recentTasks) {
+      const s = (t.input_text || "").toLowerCase();
+
+  if (
+    s === "/time" ||
+    s === "/memu" ||
+    s === "/menu" ||
+    s === "/status" ||
+    s === "/daily" ||
+    s === "/weekly" ||
+    s === "/commands"
+  ) {
+    continue;
+  }
+
+  const key = s.slice(0, 30);
+  grouped[key] = (grouped[key] || 0) + 1;  
+  }
+
+  const taskText =
+    Object.entries(grouped)
+      .map(([k, v]) => `${v}x - ${k}`)
+      .join("\n") || "Chưa có task";
+
+  let topIssues = [];
+  try {
+    const rows = await query(`
+      select 
+        case
+          when input_text ilike '%payment%' then 'payment'
+          when input_text ilike '%qr%' then 'qr'
+          when input_text ilike '%booking%' then 'booking'
+          when input_text ilike '%admin%' then 'admin'
+          when input_text ilike '%cleaner%' then 'cleaner'
+          else null
+        end as key,
+        count(*)::int as c
+      from hermes_tasks
+      where input_text is not null
+        and input_text not ilike '%git%'
+        and input_text not ilike '%readme%'
+        and input_text not ilike '%package.json%'
+        and input_text not ilike '%xem repo%'
+        and input_text not ilike '%chạy lệnh%'
+      group by key
+      having
+        case
+          when input_text ilike '%payment%' then 'payment'
+          when input_text ilike '%qr%' then 'qr'
+          when input_text ilike '%booking%' then 'booking'
+          when input_text ilike '%admin%' then 'admin'
+          when input_text ilike '%cleaner%' then 'cleaner'
+          else null
+        end is not null
+      order by c desc
+      limit 3
+    `);
+
+    topIssues = rows.rows || [];
+  } catch {}
+
+  const issueText = topIssues.length
+    ? topIssues.map((i) => `${i.c}x - ${i.key}`).join("\n")
+    : "Chưa có pattern rõ";
+
+  const appLog = await execAsync("docker logs hermes_app --tail 20 2>&1");
+  const workerLog = await execAsync("docker logs hermes_worker --tail 20 2>&1");
+
+  const appErr = (appLog.stdout || "").toLowerCase().includes("error");
+  const workerErr = (workerLog.stdout || "").toLowerCase().includes("error");
+
+  let suggestions = [];
+
+  if (topIssues.length > 0) {
+    const top = topIssues[0].key;
+
+    if (top === "payment") {
+      suggestions.push("🔥 Ưu tiên cao: Fix payment QR ngay");
+      suggestions.push("👉 Gợi ý: /audit lỗi payment QR → /codex fix → /review");
+    }
+
+    if (top === "cleaner") {
+      suggestions.push("🧹 Kiểm tra flow cleaner bot hoặc task assignment");
+    }
+
+    if (top === "booking") {
+      suggestions.push("📅 Kiểm tra booking flow / conflict / pricing");
+    }
+  }
+
+  if (memoryCount < 10) {
+    suggestions.push("🧠 Nên dùng /learn thêm để tăng GBrain");
+  }
+
+  if (activeSessions > 0) {
+    suggestions.push("⚠️ Có session đang chờ → hoàn thành flow đang dở");
+  }
+
+  if (appErr || workerErr) {
+    suggestions.push("🚨 Có dấu hiệu lỗi → chạy /audit");
+  }
+
+  if (suggestions.length === 0) {
+    suggestions.push("✅ Hệ thống ổn → tiếp tục /codex hoặc /audit");
+  }
+
+  return `📅 Hermes Daily Report
+
+🤖 System:
+- hermes_app: ${appErr ? "⚠️ issue" : "OK"}
+- hermes_worker: ${workerErr ? "⚠️ issue" : "OK"}
+
+🧠 GBrain:
+- Memories: ${memoryCount}
+
+🧩 Sessions:
+- Active: ${activeSessions}
+
+📌 Recent Tasks:
+${taskText}
+
+🔥 Top Issues:
+${issueText}
+
+🎯 Gợi ý:
+${suggestions.join("\n")}
+
+NEXT ACTION:
+- Debug → /audit <vấn đề>
+- Fix → /codex <task>
+- Review → /review <kết quả>`;
+}
+
+async function buildWeeklyReport() {
+  let tasks7d = [];
+  try {
+    const t = await query(`
+      select input_text, created_at
+      from hermes_tasks
+      where created_at >= now() - interval '7 days'
+        and input_text is not null
+    `);
+    tasks7d = t.rows || [];
+  } catch {}
+
+  const counter = {};
+  for (const t of tasks7d) {
+    const s = (t.input_text || "").toLowerCase();
+
+    let key = null;
+    if (s.includes("payment")) key = "payment";
+    else if (s.includes("qr")) key = "qr";
+    else if (s.includes("booking")) key = "booking";
+    else if (s.includes("admin")) key = "admin";
+    else if (s.includes("cleaner")) key = "cleaner";
+
+    if (!key) continue;
+    if (
+      s.includes("git") ||
+      s.includes("readme") ||
+      s.includes("package.json") ||
+      s.includes("xem repo") ||
+      s.includes("chạy lệnh")
+    )
+      continue;
+
+    counter[key] = (counter[key] || 0) + 1;
+  }
+
+  const topProblems = Object.entries(counter)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3);
+
+  const problemText = topProblems.length
+    ? topProblems.map(([k, v]) => `${v}x - ${k}`).join("\n")
+    : "Chưa có pattern rõ";
+
+  let lessons = [];
+  try {
+    const l = await query(`
+      select title, summary
+      from gbrain_memories
+      where created_at >= now() - interval '7 days'
+        and title not ilike '%test%'
+        and title not ilike '%tên người dùng%'
+        and title not ilike '%mason%'
+        and title not ilike '%demo%'
+        and summary not ilike '%test%'
+        and summary not ilike '%tên người dùng%'
+        and summary not ilike '%mason%'
+        and summary not ilike '%demo%'
+      order by created_at desc
+      limit 5
+    `);
+    lessons = l.rows || [];
+  } catch {}
+
+  const lessonText = lessons.length
+    ? lessons.map((l) => `- ${l.title}`).join("\n")
+    : "Chưa có lesson mới";
+
+  let patterns = [];
+  if (topProblems.length > 0) {
+    const [k, v] = topProblems[0];
+    if (v >= 3) {
+      patterns.push(`Lặp lại nhiều lần: ${k} (${v} lần)`);
+    }
+  }
+  if (patterns.length === 0) {
+    patterns.push("Chưa thấy pattern xấu rõ ràng");
+  }
+
+  let actions = [];
+  if (topProblems.length > 0) {
+    const [k] = topProblems[0];
+
+    if (k === "payment") {
+      actions.push("🔥 Fix dứt điểm flow payment/payOS (QR, polling, webhook)");
+      actions.push("👉 Dùng: /audit lỗi payment → /codex fix → /review");
+    }
+    if (k === "booking") {
+      actions.push("📅 Rà soát booking conflict + pricing logic");
+    }
+    if (k === "admin") {
+      actions.push("🛠 Audit admin flows + permissions (RBAC)");
+    }
+    if (k === "cleaner") {
+      actions.push("🧹 Kiểm tra cleaner bot + task assignment + photo review");
+    }
+  }
+
+  if (actions.length === 0) {
+    actions.push("✅ Hệ ổn → tiếp tục /codex để build feature");
+  }
+
+  return `📊 Hermes Weekly Report
+
+🔥 Top Problems (7d):
+${problemText}
+
+🧠 Lessons (7d):
+${lessonText}
+
+📉 Pattern:
+${patterns.join("\n")}
+
+🚀 Đề xuất:
+${actions.join("\n")}
+
+NEXT ACTION:
+- Deep debug → /audit <vấn đề>
+- Fix → /codex <task>
+- Review → /review <kết quả>`;
+}
+
+function isAllowed(userId) {
+  return ALLOWED_USER_IDS.includes(Number(userId));
+}
+
+
+async function createTask(chatId, userId, text) {
+  const result = await query(
+    `insert into hermes_tasks (telegram_chat_id, telegram_user_id, input_text, status)
+     values ($1, $2, $3, 'pending')
+     returning id`,
+    [chatId, userId, text]
+  );
+
+  const taskId = result.rows[0].id;
+
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message)
+     values ($1, 'created', $2)`,
+    [taskId, "Task created from Telegram"]
+  );
+
+  return taskId;
+}
+
+app.get("/", (req, res) => {
+  res.send("Hermes v5 Lite App Running 🚀");
+});
+
+ensureGBrainSchema()
+  .then(() => console.log("GBrain schema ready 🧠"))
+  .catch((err) => console.error("GBrain schema error:", err.message));
+
+async function pollTelegram() {
+  try {
+    const { data } = await axios.get(`${TELEGRAM_API}/getUpdates`, {
+      params: { offset, timeout: 10 },
+    });
+
+    for (const update of data.result || []) {
+      offset = update.update_id + 1;
+      
+      const callback = update.callback_query;
+
+if (callback) {
+  const data = callback.data;
+  const chatId = callback.message.chat.id;
+  
+    const callbackUserId = callback.from.id;
+
+  if (data === "menu_commands") {
+  await sendTelegramMessage(chatId, "Gõ /commands để xem toàn bộ lệnh Hermes.");
+  continue;
+}
+
+  if (data === "menu_weekly") {
+  await sendTelegramMessage(chatId, "Gõ /weekly để xem báo cáo tuần.");
+  continue;
+}  
+
+  if (data === "menu_status") {
+  await sendTelegramMessage(chatId, "Đang kiểm tra trạng thái...");
+  // gọi lại chính command /status
+  const fakeText = "/status";
+  // đơn giản: gửi lại như user
+  await sendTelegramMessage(chatId, "Gõ /status để xem chi tiết.");
+  continue;
+}
+
+  if (data === "menu_deploy_check") {
+  await sendTelegramMessage(chatId, "🚀 Nhập nội dung cần deploy-check:");
+  await query(
+    `insert into hermes_sessions (telegram_user_id, state)
+     values ($1, 'awaiting_deploy_check')
+     on conflict (telegram_user_id)
+     do update set state = 'awaiting_deploy_check', updated_at = now()`,
+    [callback.from.id]
+  );
+  continue;
+}
+
+  if (data === "menu_codex") {
+    await sendTelegramMessage(chatId, "🛠 Nhập task cần build prompt Codex:");
+    await query(
+      `insert into hermes_sessions (telegram_user_id, state)
+       values ($1, 'awaiting_codex')
+       on conflict (telegram_user_id)
+       do update set state = 'awaiting_codex', updated_at = now()`,
+      [callbackUserId]
+    );
+    continue;
+  }
+
+  if (data === "menu_review") {
+    await sendTelegramMessage(chatId, "🔍 Paste kết quả Codex cần review:");
+    await query(
+      `insert into hermes_sessions (telegram_user_id, state)
+       values ($1, 'awaiting_review')
+       on conflict (telegram_user_id)
+       do update set state = 'awaiting_review', updated_at = now()`,
+      [callbackUserId]
+    );
+    continue;
+  }
+
+  if (data === "menu_recall") {
+    await sendTelegramMessage(chatId, "🧠 Nhập từ khóa cần recall:");
+    await query(
+      `insert into hermes_sessions (telegram_user_id, state)
+       values ($1, 'awaiting_recall')
+       on conflict (telegram_user_id)
+       do update set state = 'awaiting_recall', updated_at = now()`,
+      [callbackUserId]
+    );
+    continue;
+  }
+
+  if (data === "menu_learn") {
+    await sendTelegramMessage(chatId, "🧬 Nhập bài học cần lưu:");
+    await query(
+      `insert into hermes_sessions (telegram_user_id, state)
+       values ($1, 'awaiting_learn')
+       on conflict (telegram_user_id)
+       do update set state = 'awaiting_learn', updated_at = now()`,
+      [callbackUserId]
+    );
+    continue;
+  }
+
+  if (data === "menu_audit") {
+    await sendTelegramMessage(chatId, "🧪 Nhập vấn đề cần audit:");
+    await query(
+      `insert into hermes_sessions (telegram_user_id, state)
+       values ($1, 'awaiting_audit')
+       on conflict (telegram_user_id)
+       do update set state = 'awaiting_audit', updated_at = now()`,
+      [callbackUserId]
+    );
+    continue;
+  }
+
+   if (data === "menu_daily") {
+  await sendTelegramMessage(chatId, "Gõ /daily để xem báo cáo hôm nay.");
+  continue;
+}  
+
+  if (data === "menu_codex") {
+  await sendTelegramMessage(chatId, "🛠 Nhập task cần build prompt Codex:");
+  
+  await query(
+    `insert into hermes_sessions (telegram_user_id, state)
+     values ($1, 'awaiting_codex')
+     on conflict (telegram_user_id)
+     do update set state = 'awaiting_codex'`,
+    [callback.from.id]
+  );
+
+  continue;
+}    
+
+  if (data === "menu_review") {
+    await sendTelegramMessage(chatId, "Dùng:\n/review <paste kết quả Codex>");
+    continue;
+  }
+
+  if (data === "menu_recall") {
+    await sendTelegramMessage(chatId, "Dùng:\n/recall <từ khóa>");
+    continue;
+  }
+
+  if (data === "menu_learn") {
+    await sendTelegramMessage(chatId, "Dùng:\n/learn <bài học cần lưu>");
+    continue;
+  }
+
+  if (data.startsWith("approve_")) {
+    const taskId = data.split("_")[1];
+
+    await sendTelegramMessage(chatId, `Đã duyệt task ${taskId}`);
+
+    await handleAction(`duyệt task ${taskId}`, chatId);
+  }
+
+  if (data.startsWith("reject_")) {
+    const taskId = data.split("_")[1];
+
+    await sendTelegramMessage(chatId, `Đã từ chối task ${taskId}`);
+  }
+
+  continue;
+} 
+       
+      const message = update.message;
+      if (!message?.text) continue;
+
+      const chatId = message.chat.id;
+      const userId = message.from.id;
+      const text = message.text.trim();
+      const normalized = text.toLowerCase();
+      console.log("INCOMING:", { userId, text });
+
+      if (text === "/commands") {
+  await sendTelegramMessage(chatId, `📚 Hermes Commands
+
+/menu
+Mở bảng nút nhanh.
+
+/status
+Kiểm tra trạng thái Hermes, GBrain, session, logs.
+
+/codex <task>
+Tạo prompt chuẩn cho Codex/Cursor.
+
+/review <kết quả Codex>
+Review patch, đánh giá rủi ro, auto learn vào GBrain.
+
+/audit <vấn đề>
+Audit lỗi/sự cố và tạo hướng xử lý.
+
+/deploy-check <nội dung deploy>
+Checklist an toàn trước deploy.
+
+/learn <bài học>
+Lưu memory vào GBrain.
+
+/recall <từ khóa>
+Tìm lại memory trong GBrain.
+
+Flow chuẩn:
+1. /codex <vấn đề>
+2. Copy sang Codex
+3. /review <kết quả>
+4. /recall <từ khóa> để kiểm tra Hermes đã học`);
+  continue;
+}
+
+      // ===== SESSION HANDLER =====
+const sessionResult = await query(
+  `select state from hermes_sessions where telegram_user_id = $1`,
+  [userId]
+);
+
+const sessionState = sessionResult.rows[0]?.state;
+
+      if (text === "/status") {
+  try {
+    // 1) Docker services
+    const ps = await execAsync("d	ocker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'");
+    let services = "Không lấy được docker status";
+    if (ps.ok && ps.stdout.trim()) {
+  services = ps.stdout.trim().slice(0, 1200);
+}
+    // 2) Logs nhanh
+    const appLog = await execAsync(
+      "docker logs hermes_app --tail 20 2>&1"
+    );
+    const workerLog = await execAsync(
+      "docker logs hermes_worker --tail 20 2>&1"
+    );
+
+    const appErr = (appLog.stdout || "").toLowerCase().includes("error");
+    const workerErr = (workerLog.stdout || "").toLowerCase().includes("error");
+
+    // 3) GBrain stats
+    let memoryCount = 0;
+    try {
+      const mem = await query(`select count(*)::int as c from gbrain_memories`);
+      memoryCount = mem.rows[0]?.c || 0;
+    } catch {}
+
+    // 4) Sessions
+    let activeSessions = 0;
+    try {
+      const s = await query(
+        `select count(*)::int as c from hermes_sessions where state is not null`
+      );
+      activeSessions = s.rows[0]?.c || 0;
+    } catch {}
+
+    // 5) Tổng hợp
+    const reply = `📊 Hermes Status
+
+🤖 App:
+- hermes_app: ${appErr ? "⚠️ có lỗi gần đây" : "OK"}
+- hermes_worker: ${workerErr ? "⚠️ có lỗi gần đây" : "OK"}
+
+🐳 Docker:
+${services}
+
+🧠 GBrain:
+- Memories: ${memoryCount}
+
+🧩 Sessions:
+- Active: ${activeSessions}
+
+🧪 Logs (gần nhất):
+- app: ${appErr ? "có 'error' trong 20 dòng" : "clean"}
+- worker: ${workerErr ? "có 'error' trong 20 dòng" : "clean"}
+
+NEXT ACTION:
+- Nếu có lỗi → /audit <mô tả>
+- Nếu cần fix → /codex <task>
+- Review patch → /review <kết quả>
+`;
+
+    await sendTelegramMessage(chatId, reply);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /status: ${err.message}`);
+  }
+
+  continue;
+}
+
+      if (sessionState === "awaiting_deploy_check") {
+  const result = await buildDeployCheck(text);
+  await sendTelegramMessage(chatId, `🚀 Deploy Check:\n\n${result}`);
+  await query(
+    `update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`,
+    [userId]
+  );
+  continue;
+}
+
+
+if (sessionState === "awaiting_codex") {
+  const result = await buildCodexPrompt(text);
+  await sendTelegramMessage(chatId, `🛠 Prompt Codex:\n\n${result}`);
+  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
+  continue;
+}
+
+if (sessionState === "awaiting_review") {
+  const result = await reviewCodexResult(text);
+
+  let autoLearnText = "";
+  try {
+    const memory = await learnFromText(result, "auto_review");
+    autoLearnText = `\n\n🧬 Auto Learn: đã lưu vào GBrain\n- ${memory.title}`;
+  } catch (e) {
+    autoLearnText = `\n\n⚠️ Auto Learn lỗi: ${e.message}`;
+  }
+
+  await sendTelegramMessage(chatId, `🔍 Review Patch:\n\n${result}${autoLearnText}`);
+  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
+  continue;
+}
+
+if (sessionState === "awaiting_recall") {
+  const memories = await recallMemories(text);
+  const reply = memories.length
+    ? memories.map((m) => `🧠 ${m.title}\n${m.summary}\n${m.lesson ? `Lesson: ${m.lesson}` : ""}`).join("\n\n")
+    : "Chưa tìm thấy memory liên quan.";
+
+  await sendTelegramMessage(chatId, reply);
+  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
+  continue;
+}
+
+if (sessionState === "awaiting_learn") {
+  const memory = await learnFromText(text, "button_learn");
+  await sendTelegramMessage(chatId, `🧬 Đã lưu vào GBrain:\n${memory.title}\n\n${memory.lesson || memory.summary}`);
+  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
+  continue;
+}
+
+if (sessionState === "awaiting_audit") {
+  const result = await buildAudit(text);
+  await sendTelegramMessage(chatId, `🧪 Audit:\n\n${result}`);
+  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
+  continue;
+}
+
+      const session = await query(
+  `select state from hermes_sessions where telegram_user_id = $1`,
+  [userId]
+);
+
+if (session.rows[0]?.state === "awaiting_codex") {
+  const result = await buildCodexPrompt(text);
+
+  await sendTelegramMessage(chatId, `🛠 Prompt Codex:\n\n${result}`);
+
+  await query(
+    `update hermes_sessions set state = null where telegram_user_id = $1`,
+    [userId]
+  );
+
+  continue;
+}
+
+      await query(
+        `insert into telegram_users (telegram_user_id, is_allowed)
+         values ($1, $2)
+         on conflict (telegram_user_id)
+         do update set last_seen_at = now()`,
+        [userId, isAllowed(userId)]
+      );
+
+      if (text === "/id") {
+        await sendTelegramMessage(chatId, `Telegram user_id của bạn là: ${userId}`);
+        continue;
+      }
+
+      if (!isAllowed(userId)) {
+        await sendTelegramMessage(chatId, "Bạn không có quyền sử dụng Hermes.");
+        continue;
+      }
+
+      if (text === "/health") {
+        await sendTelegramMessage(chatId, "Hermes app online ✅\nWorker sẽ xử lý task trong nền.");
+        continue;
+      }
+
+      if (text === "/time" || text.toLowerCase() === "mấy giờ rồi") {
+  const now = new Date();
+
+  const vnTime = new Intl.DateTimeFormat("vi-VN", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour12: false,
+  }).format(now);
+
+  await sendTelegramMessage(chatId, `🕒 Giờ Việt Nam hiện tại: ${vnTime}`);
+  continue;
+}
+
+      if (text === "/menu") {
+  await sendTelegramMessage(chatId, "Hermes Control Center:", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "📚 Commands", callback_data: "menu_commands" }],
+        [{ text: "📊 Status", callback_data: "menu_status" }],
+        [{ text: "🚀 Deploy Check", callback_data: "menu_deploy_check" }],
+        [{ text: "🧪 Audit", callback_data: "menu_audit" }],
+        [{ text: "🛠 Build Codex Prompt", callback_data: "menu_codex" }],
+        [{ text: "🔍 Review Patch", callback_data: "menu_review" }],
+        [{ text: "📅 Daily Report", callback_data: "menu_daily" }],
+        [{ text: "📊 Weekly Report", callback_data: "menu_weekly" }],
+        [{ text: "🧠 Recall GBrain", callback_data: "menu_recall" }],
+        [{ text: "🧬 Learn", callback_data: "menu_learn" }],
+      ],
+    },
+  });
+  continue;
+}
+
+   if (text === "/learn-history") {
+  try {
+    const res = await query(`
+      select id, category, title, created_at
+      from gbrain_memories
+      order by created_at desc
+      limit 10
+    `);
+
+    const rows = res.rows || [];
+
+    const msg = rows.length
+      ? "🧠 GBrain Recent Memories:\n\n" +
+        rows
+          .map(
+            (r) =>
+              `#${r.id} [${r.category}] - ${r.title}`
+          )
+          .join("\n")
+      : "Chưa có memory.";
+
+    await sendTelegramMessage(chatId, msg);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /learn-history: ${err.message}`);
+  }
+
+  continue;
+}
+
+   if (text === "/memory-stats") {
+  try {
+    const res = await query(`
+      select category, count(*)::int as c
+      from gbrain_memories
+      group by category
+      order by c desc
+    `);
+
+    const rows = res.rows || [];
+
+    const allCategories = [
+      "known_bug",
+      "coding_rule",
+      "deployment_rule",
+      "ops_sop",
+      "project_context",
+    ];
+
+    const map = {};
+    for (const r of rows) {
+      map[r.category] = r.c;
+    }
+
+    const msg = `🧠 Memory Stats
+
+known_bug: ${map["known_bug"] || 0}
+coding_rule: ${map["coding_rule"] || 0}
+deployment_rule: ${map["deployment_rule"] || 0}
+ops_sop: ${map["ops_sop"] || 0}
+project_context: ${map["project_context"] || 0}
+`;
+
+    await sendTelegramMessage(chatId, msg);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /memory-stats: ${err.message}`);
+  }
+
+  continue;
+}
+
+   if (text.startsWith("/quick-fix")) {
+  try {
+    const input = text.replace("/quick-fix", "").trim();
+
+    if (!input) {
+      await sendTelegramMessage(chatId, "Dùng: /quick-fix <vấn đề>");
+      continue;
+    }
+
+    // 1. Audit (chỉ lấy nhận định ngắn)
+    const audit = await buildAudit(input);
+
+    const quickSummary = audit
+      .split("ROOT CAUSE")[0]   // lấy phần đầu thôi
+      .replace("NHẬN ĐỊNH NHANH:", "")
+      .trim();
+
+    // 2. Codex prompt (giữ full)
+    const codex = await buildCodexPrompt(input);
+
+    // 3. Reply gọn
+    const reply = `⚡ Quick Fix
+
+🧠 Nhận định:
+${quickSummary}
+
+🛠 Prompt Codex:
+${codex}
+
+👉 NEXT:
+1. Copy prompt sang Codex
+2. Paste kết quả vào /review`;
+
+    await sendTelegramMessage(chatId, reply);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /quick-fix: ${err.message}`);
+  }
+
+  continue;
+}
+
+   if (text.startsWith("/forget")) {
+  try {
+    const id = text.split(" ")[1];
+
+    if (!id) {
+      await sendTelegramMessage(chatId, "Dùng: /forget <id>");
+      continue;
+    }
+
+    const result = await query(
+      `delete from gbrain_memories where id = $1 returning id`,
+      [id]
+    );
+
+    if (result.rowCount > 0) {
+      await sendTelegramMessage(chatId, `🗑️ Đã xoá memory #${id}`);
+    } else {
+      await sendTelegramMessage(chatId, `Không tìm thấy memory #${id}`);
+    }
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /forget: ${err.message}`);
+  }
+
+  continue;
+}
+
+      if (text.startsWith("/learn")) {
+  const input = text.replace("/learn", "").trim();
+
+  if (!input) {
+    await sendTelegramMessage(chatId, "Bạn cần gửi nội dung sau /learn.");
+    continue;
+  }
+
+  try {
+    const memory = await learnFromText(input, "telegram");
+    await sendTelegramMessage(
+      chatId,
+      `🧬 Đã lưu vào GBrain:\n${memory.title}\n\nLesson: ${memory.lesson || memory.summary}`
+    );
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /learn: ${err.message}`);
+  }
+
+  continue;
+}
+
+if (text.startsWith("/recall")) {
+  const input = text.replace("/recall", "").trim();
+
+  if (!input) {
+    await sendTelegramMessage(chatId, "Bạn cần nhập từ khóa sau /recall.");
+    continue;
+  }
+
+  try {
+    const memories = await recallMemories(input);
+
+    if (!memories.length) {
+      await sendTelegramMessage(chatId, "Chưa tìm thấy memory liên quan.");
+      continue;
+    }
+
+    const reply = memories
+      .map(
+        (m) =>
+          `🧠 ${m.title}\n${m.summary}\n${m.lesson ? `Lesson: ${m.lesson}` : ""}\nTags: ${(m.tags || []).join(", ")}`
+      )
+      .join("\n\n");
+
+    await sendTelegramMessage(chatId, reply);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /recall: ${err.message}`);
+  }
+
+  continue;
+}
+
+      if (text.startsWith("/codex")) {
+  const input = text.replace("/codex", "").trim();
+
+  if (!input) {
+    await sendTelegramMessage(chatId, "Bạn cần gửi nội dung sau /codex.");
+    continue;
+  }
+
+  try {
+    const result = await buildCodexPrompt(input);
+    await sendTelegramMessage(chatId, `🛠 Prompt Codex:\n\n${result}`);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /codex: ${err.message}`);
+  }
+
+  continue;
+}
+
+if (text.startsWith("/review")) {
+  const input = text.replace("/review", "").trim();
+
+  if (!input) {
+    await sendTelegramMessage(chatId, "Bạn cần paste kết quả Codex sau /review.");
+    continue;
+  }
+
+  try {
+
+    const result = await reviewCodexResult(input);
+
+let autoLearnText = "";
+
+if (
+  result.includes("LESSON NÊN LƯU") ||
+  result.includes("LESSON NEN LUU") ||
+  result.includes("lesson")
+) {
+  try {
+    const memory = await learnFromText(result, "auto_review");
+    autoLearnText = `\n\n🧬 Auto Learn: đã lưu vào GBrain\n- ${memory.title}`;
+  } catch (e) {
+    console.error("Auto learn failed:", e.message);
+    autoLearnText = `\n\n⚠️ Auto Learn lỗi: ${e.message}`;
+  }
+}
+
+await sendTelegramMessage(
+  chatId,
+  `🔍 Review Patch:\n\n${result}${autoLearnText}`
+);
+
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /review: ${err.message}`);
+  }
+
+  continue;
+}
+
+    if (text.startsWith("/audit")) {
+  const input = text.replace("/audit", "").trim();
+
+  if (!input) {
+    await sendTelegramMessage(chatId, "Bạn cần gửi nội dung sau /audit.");
+    continue;
+  }
+
+  try {
+    const result = await buildAudit(input);
+    await sendTelegramMessage(chatId, `🧪 Audit:\n\n${result}`);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /audit: ${err.message}`);
+  }
+
+  continue;
+}
+
+    if (text.startsWith("/deploy-check")) {
+  const input = text.replace("/deploy-check", "").trim();
+
+  try {
+    const result = await buildDeployCheck(input);
+    await sendTelegramMessage(chatId, `🚀 Deploy Check:\n\n${result}`);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /deploy-check: ${err.message}`);
+  }
+
+  continue;
+}
+
+    if (text === "/weekly") {
+  try {
+    // 1) Tasks 7 ngày
+    let tasks7d = [];
+    try {
+      const t = await query(`
+        select input_text, created_at
+        from hermes_tasks
+        where created_at >= now() - interval '7 days'
+          and input_text is not null
+      `);
+      tasks7d = t.rows || [];
+    } catch {}
+
+    // 2) Gom nhóm vấn đề (lọc noise + normalize)
+    const counter = {};
+    for (const t of tasks7d) {
+      const s = (t.input_text || "").toLowerCase();
+
+      let key = null;
+      if (s.includes("payment")) key = "payment";
+      else if (s.includes("qr")) key = "qr";
+      else if (s.includes("booking")) key = "booking";
+      else if (s.includes("admin")) key = "admin";
+      else if (s.includes("cleaner")) key = "cleaner";
+
+      // bỏ noise
+      if (!key) continue;
+      if (s.includes("git") || s.includes("readme") || s.includes("package.json") || s.includes("xem repo") || s.includes("chạy lệnh")) continue;
+
+      counter[key] = (counter[key] || 0) + 1;
+    }
+
+    const topProblems = Object.entries(counter)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+
+    const problemText = topProblems.length
+      ? topProblems.map(([k, v]) => `${v}x - ${k}`).join("\n")
+      : "Chưa có pattern rõ";
+
+    // 3) Lessons từ GBrain (7 ngày)
+    let lessons = [];
+    try {
+      const l = await query(`
+        select title, summary
+  from gbrain_memories
+  where created_at >= now() - interval '7 days'
+    and title not ilike '%test%'
+    and title not ilike '%tên người dùng%'
+    and title not ilike '%mason%'
+    and title not ilike '%demo%'
+    and summary not ilike '%test%'
+    and summary not ilike '%tên người dùng%'
+    and summary not ilike '%mason%'
+    and summary not ilike '%demo%'
+  order by created_at desc
+  limit 5
+      `);
+      lessons = l.rows || [];
+    } catch {}
+
+    const lessonText = lessons.length
+      ? lessons.map((l) => `- ${l.title}`).join("\n")
+      : "Chưa có lesson mới";
+
+    // 4) Pattern xấu
+    let patterns = [];
+    if (topProblems.length > 0) {
+      const [k, v] = topProblems[0];
+      if (v >= 3) {
+        patterns.push(`Lặp lại nhiều lần: ${k} (${v} lần)`);
+      }
+    }
+    if (patterns.length === 0) {
+      patterns.push("Chưa thấy pattern xấu rõ ràng");
+    }
+
+    // 5) Đề xuất hành động
+    let actions = [];
+    if (topProblems.length > 0) {
+      const [k] = topProblems[0];
+
+      if (k === "payment") {
+        actions.push("🔥 Fix dứt điểm flow payment/payOS (QR, polling, webhook)");
+        actions.push("👉 Dùng: /audit lỗi payment → /codex fix → /review");
+      }
+      if (k === "booking") {
+        actions.push("📅 Rà soát booking conflict + pricing logic");
+      }
+      if (k === "admin") {
+        actions.push("🛠 Audit admin flows + permissions (RBAC)");
+      }
+      if (k === "cleaner") {
+        actions.push("🧹 Kiểm tra cleaner bot + task assignment + photo review");
+      }
+    }
+
+    if (actions.length === 0) {
+      actions.push("✅ Hệ ổn → tiếp tục /codex để build feature");
+    }
+
+    // 6) Reply
+    const reply = `📊 Hermes Weekly Report
+
+🔥 Top Problems (7d):
+${problemText}
+
+🧠 Lessons (7d):
+${lessonText}
+
+📉 Pattern:
+${patterns.join("\n")}
+
+🚀 Đề xuất:
+${actions.join("\n")}
+
+NEXT ACTION:
+- Deep debug → /audit <vấn đề>
+- Fix → /codex <task>
+- Review → /review <kết quả>
+`;
+
+    await sendTelegramMessage(chatId, reply);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /weekly: ${err.message}`);
+  }
+
+  continue;
+}
+
+ 
+  if (text === "/daily") {
+  try {
+    const report = await buildDailyReport();
+    await sendTelegramMessage(chatId, report);
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /daily: ${err.message}`);
+  }
+
+  continue;
+}
+  
+
+
+      const taskId = await createTask(chatId, userId, text);
+      await sendTelegramMessage(chatId, `Đã nhận task #${taskId}. Hermes đang xử lý...`);
+    }
+  } catch (err) {
+    console.error("Polling error:", err.response?.data || err.message);
+  }
+
+  setTimeout(pollTelegram, 1000);
+}
+
+function getVietnamDateKey() {
+  return new Date().toLocaleDateString("en-US", {
+    timeZone: "Asia/Ho_Chi_Minh",
+  });
+}
+
+
+function getVietnamHourMinute() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+
+  const hour = parts.find(p => p.type === "hour")?.value;
+  const minute = parts.find(p => p.type === "minute")?.value;
+
+  return `${hour}:${minute}`;
+}
+
+function getVietnamWeekday() {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    weekday: "short",
+  }).format(new Date());
+}
+
+async function sendAutoReport() {
+  if (!OWNER_CHAT_ID) return;
+
+  const dateKey = getVietnamDateKey();
+  const time = getVietnamHourMinute();
+  const weekday = getVietnamWeekday();
+
+  // Daily: mỗi ngày 08:30 VN
+  if (AUTO_DAILY_ENABLED && time === "08:30" && lastDailyKey !== dateKey) {
+    lastDailyKey = dateKey;
+    await sendTelegramMessage(
+      OWNER_CHAT_ID,
+      "📅 Auto Daily Report\n\nGõ /daily để xem báo cáo hôm nay."
+    );
+  }
+
+  // Weekly: thứ 2 08:35 VN
+  if (
+    AUTO_WEEKLY_ENABLED &&
+    weekday === "Mon" &&
+    time === "08:35" &&
+    lastWeeklyKey !== dateKey
+  ) {
+    lastWeeklyKey = dateKey;
+    await sendTelegramMessage(
+      OWNER_CHAT_ID,
+      "📊 Auto Weekly Report\n\nGõ /weekly để xem báo cáo tuần."
+    );
+  }
+}
+
+setInterval(() => {
+  sendAutoReport().catch((err) =>
+    console.error("Auto report error:", err.message)
+  );
+}, 60 * 1000);
+
+pollTelegram();
+
+app.listen(3000, () => {
+  console.log("Hermes app running on port 3000");
+});
