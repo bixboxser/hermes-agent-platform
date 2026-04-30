@@ -53,6 +53,15 @@ async function ensureGBrainSchema() {
 
     alter table hermes_approvals
       add column if not exists executed_at timestamptz;
+
+    alter table hermes_memories
+      add column if not exists memory_type text default 'project_context';
+    alter table hermes_memories
+      add column if not exists importance int default 3;
+    alter table hermes_memories
+      add column if not exists confidence numeric default 0.7;
+    alter table hermes_memories
+      add column if not exists last_used_at timestamptz;
   `);
 
 }
@@ -147,7 +156,7 @@ async function learnFromText(input, source = "telegram") {
   };
 }
 
-async function recallMemories(searchText) {
+async function recallMemories(searchText, memoryType = null) {
   const q = `%${searchText}%`;
 
   const result = await query(
@@ -165,6 +174,17 @@ async function recallMemories(searchText) {
   return result.rows;
 }
 
+
+async function recallStructuredMemories(memoryType) {
+  const result = await query(
+    `select * from hermes_memories where memory_type=$1 order by coalesce(last_used_at, updated_at, created_at) desc limit 10`,
+    [memoryType],
+  );
+  if (result.rows.length) {
+    await query(`update hermes_memories set last_used_at=now() where id = any($1::bigint[])`, [result.rows.map((r) => r.id)]);
+  }
+  return result.rows;
+}
 async function runHermesDispatcher(input) {
 
   const lowerInput = String(input || "").toLowerCase();
@@ -849,6 +869,7 @@ NEXT ACTION:
 
 
 module.exports = {
+  recallStructuredMemories,
   ensureGBrainSchema,
   learnFromText,
   recallMemories,

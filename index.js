@@ -1,6 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const { query } = require("./db");
+const { getSystemHealth } = require("./dispatcher/health");
 const {
   ensureGBrainSchema,
   learnFromText,
@@ -13,6 +14,17 @@ const {
 } = require("./gbrain");
 const app = express();
 app.use(express.json());
+
+app.get('/health', async (_req, res) => {
+  try {
+    const health = await getSystemHealth();
+    const code = health.status === 'down' ? 503 : 200;
+    return res.status(code).json(health);
+  } catch (_e) {
+    return res.status(503).json({ status: 'down', env: process.env.HERMES_ENV || 'dev', db: { ok: false } });
+  }
+});
+
 
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
 const AUTO_DAILY_ENABLED = process.env.AUTO_DAILY_ENABLED === "true";
