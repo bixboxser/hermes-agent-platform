@@ -17,6 +17,11 @@ create table if not exists hermes_tasks (
   error_text text,
   issue_url text,
   issue_number bigint,
+  codex_triggered_at timestamptz,
+  codex_trigger_comment_url text,
+  pull_request_url text,
+  pull_request_number bigint,
+  pull_request_detected_at timestamptz,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
