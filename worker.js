@@ -5,20 +5,52 @@ const { promisify } = require("util");
 const fs = require("fs");
 const path = require("path");
 const { query } = require("./db");
+const envConfig = require("./config/env");
+const { checkCommand } = require("./config/commandGuard");
+const { validateReplyTarget } = require("./config/dbGuard");
 
-const execAsync = promisify(exec);
+const rawExecAsync = promisify(exec);
+
+async function execAsync(command, options = {}) {
+  const decision = checkCommand(command, envConfig.APP_ENV);
+
+  if (!decision.allowed) {
+    throw new Error(`[command] blocked reason=${decision.reason}`);
+  }
+
+  if (decision.requiresApproval) {
+    throw new Error(`[command] blocked reason=${decision.reason} requiresApproval=true`);
+  }
+
+  return rawExecAsync(command, options);
+}
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-const PROJECT_ROOT = "/root/projects/somewhere-sanctuary-hub-main-final";
+const PROJECT_ROOT = envConfig.projectRoot;
 
 const ai = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseURL: "https://api.deepseek.com",
 });
 
-async function sendTelegramMessage(chatId, text, buttons = null) {
+async function sendTelegramMessage(chatId, text, buttons = null, telegramUserId = null) {
+  if (process.env.DISABLE_TELEGRAM === "true") {
+    console.log("[telegram skipped] env=%s reason=DISABLE_TELEGRAM", envConfig.APP_ENV);
+    return;
+  }
+
+  if (!envConfig.effectiveTelegramEnabled) {
+    console.log("[telegram skipped] env=%s reason=env_disabled", envConfig.APP_ENV);
+    return;
+  }
+
+  validateReplyTarget({
+    telegram_chat_id: chatId,
+    telegram_user_id: telegramUserId,
+  }, envConfig.APP_ENV);
+
   const MAX = 3500;
   const chunks = String(text).match(new RegExp(`[\\s\\S]{1,${MAX}}`, "g")) || [""];
 
@@ -87,7 +119,6 @@ function assertCanEditFile(filePath) {
     throw new Error(`File được bảo vệ, không cho Hermes sửa: ${filePath}`);
   }
 }
-
 
 function shouldRunBuildForFile(filePath) {
   const normalized = filePath.replace(/\\/g, "/");
@@ -227,11 +258,12 @@ async function runSafeCommand(taskId, command) {
     await event(taskId, 'approval_requested', `Risky command requires approval: ${command}`, { command });
 
   const taskRow = await query(
-  `select telegram_chat_id from hermes_tasks where id=$1`,
+  `select telegram_chat_id, telegram_user_id from hermes_tasks where id=$1`,
   [taskId]
 );
 
 const chatId = taskRow.rows[0]?.telegram_chat_id;
+const telegramUserId = taskRow.rows[0]?.telegram_user_id;
 
 if (chatId) {
   await sendTelegramMessage(
@@ -243,6 +275,7 @@ if (chatId) {
         { text: "❌ Từ chối", callback_data: `reject_${taskId}` },
       ],
     ]
+    , telegramUserId
   );
 }
 
@@ -260,8 +293,6 @@ return "Đang chờ bạn duyệt...";
 
   return [stdout, stderr].filter(Boolean).join("\n") || "Lệnh chạy xong, không có output.";
 }
-
-
 
 async function classifyIntent(text) {
   const intent = detectIntent(text);
@@ -437,7 +468,6 @@ const aiRes = await ai.chat.completions.create({
 
   return `Patch #${id} (${r.rows[0].file_path}):\n\n${r.rows[0].diff_text.slice(0, 3500)}`;
 }
-
 
 if (intent === "approve_patch") {
   const m = text.match(/\d+/);
@@ -675,11 +705,7 @@ return [
   return `Hermes đã ghi nhớ: ${memoryText}`;
 }
 
-
   const isAudit = text.toLowerCase().includes("audit")    || text.toLowerCase().includes("đánh giá")    || text.toLowerCase().includes("phân tích");  const isExecute = text.toLowerCase().includes("fix")   || text.toLowerCase().includes("sửa")   || text.toLowerCase().includes("build");  const isComplex = isAudit || isExecute;
-
-
-
 
   if (intent === "repo_status") {
     if (!fs.existsSync(PROJECT_ROOT)) {
@@ -694,7 +720,6 @@ return [
 
     return `Repo root:\n${PROJECT_ROOT}\n\nFiles:\n${files || "(trống)"}`;
   }
-
 
   if (intent === "branch_status") {
     const current = await execAsync(`git branch --show-current`, {
@@ -743,7 +768,6 @@ return [
     await logAction(task.id, "run_command", { command }, { output }, "success");
     return output;
   }
-
 
   if (intent === "rollback_patch") {
     const m = text.match(/\d+/);
@@ -917,7 +941,6 @@ const output = [stdout, stderr].filter(Boolean).join("\n") || "Lệnh chạy xon
   }
 }  
 
-
   if (intent === "reject_task") {
     const match = text.match(/\d+/);
     if (!match) return "Bạn cần nói: từ chối task 12";
@@ -956,7 +979,6 @@ Lệnh không được chạy:
 ${approval.command}`;
   }
 
-
   const memories = await loadMemories();
   const useMemory = intent === "learn" || intent === "recall_memory";
 
@@ -976,8 +998,6 @@ Detected Hermes system:
 - gbrain.js stores and retrieves memories.
 - docker-compose.yml runs app, worker, and db services.
 `;
-
-
 
   const response = await ai.chat.completions.create({
     model: process.env.DEEPSEEK_MODEL || "deepseek-chat",
@@ -1072,7 +1092,10 @@ async function processOneTask() {
     );
 
     await event(task.id, "completed", "Task completed");
-    await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} hoàn tất:\n\n${output}`);
+    await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} hoàn tất:
+
+${output}`, null, task.telegram_user_id);
+
   } catch (err) {
     const errorText = err.response?.data ? JSON.stringify(err.response.data) : err.message;
 
@@ -1082,7 +1105,9 @@ async function processOneTask() {
     );
 
     await event(task.id, "failed", errorText);
-    await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} bị lỗi:\n${errorText}`);
+    await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} bị lỗi:
+${errorText}`, null, task.telegram_user_id);
+
   }
 }
 
@@ -1096,5 +1121,6 @@ async function loop() {
   setTimeout(loop, 2000);
 }
 
+envConfig.logStartupConfig();
 console.log("Hermes Dev Agent worker started");
 loop();
