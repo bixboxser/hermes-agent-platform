@@ -223,7 +223,9 @@ async function runSafeCommand(taskId, command) {
        values ($1, 'command_requires_approval', $2, 'pending')`,
       [taskId, command]
     );
-  
+
+    await event(taskId, 'approval_requested', `Risky command requires approval: ${command}`, { command });
+
   const taskRow = await query(
   `select telegram_chat_id from hermes_tasks where id=$1`,
   [taskId]
@@ -264,6 +266,7 @@ return "Đang chờ bạn duyệt...";
 async function classifyIntent(text) {
   const intent = detectIntent(text);
   console.log("INTENT:", intent, "| TEXT:", text);
+  return intent;
 }
 
 async function loadMemories() {
@@ -297,6 +300,18 @@ function buildSimpleDiff(oldContent, newContent) {
 
 function detectIntent(text) {
   const lower = text.toLowerCase();
+
+  if (lower.includes("chạy lệnh")) {
+    return "run_command";
+  }
+
+  if (lower.includes("duyệt task")) {
+    return "approve_task";
+  }
+
+  if (lower.includes("từ chối task")) {
+    return "reject_task";
+  }
 
   // recall memory
   if (lower.includes("nhớ gì") || lower.includes("memory")) {
@@ -830,24 +845,62 @@ return [
 
   const targetTaskId = Number(match[0]);
 
-  const result = await query(
-    `select * from hermes_approvals
-     where task_id=$1 and status='pending'
-     order by id desc limit 1`,
+  const approveResult = await query(
+    `with picked as (
+       select id
+       from hermes_approvals
+       where task_id=$1 and status='pending'
+       order by id desc
+       limit 1
+     )
+     update hermes_approvals a
+     set status='approved', approved_at=now()
+     from picked
+     where a.id = picked.id
+       and a.status = 'pending'
+     returning a.*`,
     [targetTaskId]
   );
 
-  const approval = result.rows[0];
-  if (!approval) return `Không có approval pending cho task #${targetTaskId}`;
+  const approval = approveResult.rows[0];
+  if (!approval) {
+    const latest = await query(
+      `select * from hermes_approvals where task_id=$1 order by id desc limit 1`,
+      [targetTaskId]
+    );
 
-  await query(
+    const latestApproval = latest.rows[0];
+    if (!latestApproval) return `Không có approval cho task #${targetTaskId}`;
+    if (latestApproval.status === "rejected") {
+      return `Task #${targetTaskId} đã bị từ chối trước đó.`;
+    }
+    if (latestApproval.status === "approved" && latestApproval.executed_at) {
+      return `Task #${targetTaskId} đã được duyệt và chạy trước đó, không chạy lại.`;
+    }
+    return `Không có approval pending cho task #${targetTaskId}`;
+  }
+
+  await event(task.id, "approval_decided", `Approved risky command for task #${targetTaskId}`, {
+    approvalId: approval.id,
+    command: approval.command,
+    decision: "approved",
+  });
+
+  const executeGate = await query(
     `update hermes_approvals
-     set status='approved', approved_at=now()
-     where id=$1`,
+     set executed_at=now()
+     where id=$1
+       and status='approved'
+       and executed_at is null
+     returning *`,
     [approval.id]
   );
 
-  // 🔥 CHẠY LỆNH SAU KHI DUYỆT
+  if (!executeGate.rows[0]) {
+    return `Task #${targetTaskId} đã được xử lý trước đó, không chạy lại.`;
+  }
+
+  // 🔥 CHẠY LỆNH SAU KHI DUYỆT (idempotent)
   try {
     const { stdout, stderr } = await execAsync(approval.command, {
   cwd: PROJECT_ROOT,
@@ -863,6 +916,45 @@ const output = [stdout, stderr].filter(Boolean).join("\n") || "Lệnh chạy xon
     return `Đã duyệt nhưng chạy lệnh lỗi:\n${err.message}`;
   }
 }  
+
+
+  if (intent === "reject_task") {
+    const match = text.match(/\d+/);
+    if (!match) return "Bạn cần nói: từ chối task 12";
+
+    const targetTaskId = Number(match[0]);
+
+    const result = await query(
+      `with picked as (
+         select id
+         from hermes_approvals
+         where task_id=$1 and status='pending'
+         order by id desc
+         limit 1
+       )
+       update hermes_approvals a
+       set status='rejected', rejected_at=now()
+       from picked
+       where a.id = picked.id
+         and a.status = 'pending'
+       returning a.*`,
+      [targetTaskId]
+    );
+
+    const approval = result.rows[0];
+    if (!approval) return `Không có approval pending cho task #${targetTaskId}`;
+
+    await event(task.id, "approval_decided", `Rejected risky command for task #${targetTaskId}`, {
+      approvalId: approval.id,
+      command: approval.command,
+      decision: "rejected",
+    });
+
+    return `Đã từ chối task #${targetTaskId} ❌
+
+Lệnh không được chạy:
+${approval.command}`;
+  }
 
 
   const memories = await loadMemories();
