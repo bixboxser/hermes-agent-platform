@@ -52,6 +52,67 @@ async function sendTelegramMessage(chatId, text, extra ={}) {
   });
 }
 
+async function createGithubIssue(taskText) {
+  const token = process.env.GITHUB_TOKEN;
+  const owner = process.env.GITHUB_OWNER;
+  const repo = process.env.GITHUB_REPO;
+
+  if (!token || !owner || !repo) {
+    throw new Error("Missing GitHub env: GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO");
+  }
+
+  const issueBody = `[TASK] ${taskText}
+
+[CONTEXT]
+This is Hermes Agent Platform.
+Do not reference or modify any external project.
+
+[READ FIRST]
+
+* index.js
+* worker.js
+* gbrain.js
+* db/**
+* docker-compose.yml
+
+[REQUIREMENTS]
+
+* Follow existing architecture
+* Do not break Telegram bot
+* Log lifecycle events into hermes_task_events
+* Preserve duplicate issue protection logic
+
+[ACCEPTANCE]
+
+* Feature works end-to-end
+* Code builds
+* No regression
+
+[OUTPUT]
+Create a pull request with implementation.`;
+
+  const res = await axios.post(
+    `https://api.github.com/repos/${owner}/${repo}/issues`,
+    {
+      title: `[Code Agent] ${taskText.slice(0, 120)}`,
+      body: issueBody,
+      labels: ["code-agent"],
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    }
+  );
+
+  return {
+    issueUrl: res.data.html_url,
+    issueNumber: res.data.number,
+  };
+}
+
 async function buildDailyReport() {
   let memoryCount = 0;
   try {
@@ -356,6 +417,81 @@ async function createTask(chatId, userId, text) {
   );
 
   return taskId;
+}
+
+async function createCodeAgentTask(chatId, userId, taskText) {
+  const duplicate = await query(
+    `select id, issue_url
+     from hermes_tasks
+     where telegram_user_id = $1
+       and intent = 'code_agent_request'
+       and input_text = $2
+       and issue_url is not null
+     order by created_at desc
+     limit 1`,
+    [userId, taskText]
+  );
+
+  if (duplicate.rows[0]) {
+    return { duplicate: true, issueUrl: duplicate.rows[0].issue_url };
+  }
+
+  const taskResult = await query(
+    `insert into hermes_tasks (telegram_chat_id, telegram_user_id, input_text, intent, status)
+     values ($1, $2, $3, 'code_agent_request', 'running')
+     returning id`,
+    [chatId, userId, taskText]
+  );
+
+  const taskId = taskResult.rows[0].id;
+
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message)
+     values ($1, 'code_issue_requested', $2)`,
+    [taskId, "Telegram /code request received"]
+  );
+
+  try {
+    const { issueUrl, issueNumber } = await createGithubIssue(taskText);
+
+    await query(
+      `update hermes_tasks
+       set status = 'completed',
+           issue_url = $1,
+           issue_number = $2,
+           result_text = $3,
+           updated_at = now()
+       where id = $4`,
+      [issueUrl, issueNumber, `GitHub issue created: ${issueUrl}`, taskId]
+    );
+
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload)
+       values ($1, 'code_issue_created', $2, $3)`,
+      [taskId, `Issue #${issueNumber} created`, { issue_url: issueUrl, issue_number: issueNumber }]
+    );
+
+    return { duplicate: false, issueUrl, issueNumber };
+  } catch (err) {
+    const errorText = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+
+    await query(
+      `update hermes_tasks
+       set status = 'failed',
+           error_text = $1,
+           updated_at = now()
+       where id = $2`,
+      [errorText, taskId]
+    );
+
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload)
+       values ($1, 'code_issue_failed', $2, $3)`,
+      [taskId, "GitHub issue creation failed", { error: errorText }]
+    );
+
+    throw err;
+  }
 }
 
 app.get("/", (req, res) => {
@@ -986,6 +1122,28 @@ if (text.startsWith("/recall")) {
     await sendTelegramMessage(chatId, `🛠 Prompt Codex:\n\n${result}`);
   } catch (err) {
     await sendTelegramMessage(chatId, `Lỗi /codex: ${err.message}`);
+  }
+
+  continue;
+}
+
+if (text.startsWith("/code")) {
+  const input = text.replace("/code", "").trim();
+
+  if (!input) {
+    await sendTelegramMessage(chatId, "Bạn cần gửi nội dung sau /code.");
+    continue;
+  }
+
+  try {
+    const result = await createCodeAgentTask(chatId, userId, input);
+    if (result.duplicate) {
+      await sendTelegramMessage(chatId, `Issue đã tồn tại cho task này: ${result.issueUrl}`);
+    } else {
+      await sendTelegramMessage(chatId, `✅ Đã tạo GitHub Issue #${result.issueNumber}:\n${result.issueUrl}`);
+    }
+  } catch (err) {
+    await sendTelegramMessage(chatId, `Lỗi /code: ${err.message}`);
   }
 
   continue;
