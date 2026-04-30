@@ -656,6 +656,8 @@ if (callback) {
     const taskId = data.split("_")[1];
 
     await sendTelegramMessage(chatId, `Đã từ chối task ${taskId}`);
+
+    await handleAction(`từ chối task ${taskId}`, chatId);
   }
 
   continue;

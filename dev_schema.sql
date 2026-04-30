@@ -6,5 +6,6 @@ create table if not exists hermes_approvals (
   status text not null default 'pending',
   requested_at timestamptz default now(),
   approved_at timestamptz,
-  rejected_at timestamptz
+  rejected_at timestamptz,
+  executed_at timestamptz
 );
