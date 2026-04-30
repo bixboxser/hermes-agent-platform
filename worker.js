@@ -6,26 +6,28 @@ const fs = require("fs");
 const path = require("path");
 const { query } = require("./db");
 const envConfig = require("./config/env");
-const { checkCommand } = require("./config/commandGuard");
+const { shouldRequireApproval } = require('./dispatcher/safety');
+const { getOrCreateSession, updateSession, logSessionAction } = require('./dispatcher/session');
+const { runGate } = require('./dispatcher/gate');
+const { claimNextTask, heartbeatTask, releaseTask, failTask, recoverStaleTasks } = require('./dispatcher/queue');
 const { validateReplyTarget } = require("./config/dbGuard");
+const { detectAndHandleStuckTasks, checkHighFailureRate, checkStuckApprovals } = require('./dispatcher/monitor');
+const { handleTaskFailure } = require('./dispatcher/autodebug');
+const { createPlan, taskType } = require('./dispatcher/planner');
+const { executePlan } = require('./dispatcher/planExecutor');
+const { runWithRoles } = require('./dispatcher/roleController');
+const { runDueGoals } = require('./dispatcher/goalRunner');
 
 const rawExecAsync = promisify(exec);
 
 async function execAsync(command, options = {}) {
-  const decision = checkCommand(command, envConfig.APP_ENV);
-
-  if (!decision.allowed) {
-    throw new Error(`[command] blocked reason=${decision.reason}`);
-  }
-
-  if (decision.requiresApproval) {
-    throw new Error(`[command] blocked reason=${decision.reason} requiresApproval=true`);
-  }
-
+  const decision = shouldRequireApproval(command, envConfig.HERMES_ENV);
+  if (!decision.allowed) throw new Error(`[command] blocked reason=${decision.reason}`);
+  if (decision.requiresApproval) throw new Error(`[command] blocked reason=approval_required risk=${decision.riskLevel}`);
   return rawExecAsync(command, options);
 }
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_TOKEN = envConfig.TELEGRAM_TOKEN || process.env.TELEGRAM_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
 const PROJECT_ROOT = envConfig.projectRoot;
@@ -1072,47 +1074,83 @@ ${memoryContext}
   return response.choices?.[0]?.message?.content || "Hermes chưa tạo được câu trả lời.";
 }
 
-async function processOneTask() {
-  const result = await query(
-    `select * from hermes_tasks where status='pending' order by id asc limit 1`
-  );
+const WORKER_ID = process.env.HERMES_WORKER_ID || `worker-${process.pid}`;
 
-  const task = result.rows[0];
+async function upsertWorkerHeartbeat(status = 'alive') {
+  await query(`insert into hermes_worker_status (worker_id, last_heartbeat_at, status) values ($1, now(), $2)\n    on conflict (worker_id) do update set last_heartbeat_at=excluded.last_heartbeat_at, status=excluded.status`, [WORKER_ID, status]);
+}
+
+
+async function processOneTask() {
+  const task = await claimNextTask(WORKER_ID);
   if (!task) return;
 
   try {
-    await query(`update hermes_tasks set status='running', updated_at=now() where id=$1`, [task.id]);
+    await upsertWorkerHeartbeat('alive');
+    await heartbeatTask(task.id, WORKER_ID);
+    const heartbeatTimer = setInterval(() => { heartbeatTask(task.id, WORKER_ID).catch(() => {}); upsertWorkerHeartbeat('alive').catch(() => {}); }, 12000);
+    const session = await getOrCreateSession(task.id);
     await event(task.id, "started", "Worker started task");
 
-    const output = await runAction(task);
+    const finalResult = await runWithRoles(task, session, {
+      runAction,
+      projectRoot: PROJECT_ROOT,
+      taskType: taskType(task.input_text || ''),
+    });
+    await sendTelegramMessage(task.telegram_chat_id, `Task executed, under review`, null, task.telegram_user_id);
 
-    await query(
-      `update hermes_tasks set status='completed', result_text=$1, updated_at=now() where id=$2`,
-      [output, task.id]
-    );
+    await updateSession(task.id, { status: finalResult.status, last_gate_status: finalResult.review_status === 'approved' ? 'passed' : 'failed' });
+    await logSessionAction(session.id, 'review', finalResult.review_status, finalResult);
+
+    if (finalResult.review_status === 'approved') {
+      await releaseTask(task.id, WORKER_ID, 'completed', JSON.stringify(finalResult));
+      await sendTelegramMessage(task.telegram_chat_id, `Task approved`, null, task.telegram_user_id);
+    } else {
+      await failTask(task.id, WORKER_ID, (finalResult.issues || []).join('; '), false);
+      await sendTelegramMessage(task.telegram_chat_id, `Task rejected: ${(finalResult.issues || ['unknown']).join('; ')}`, null, task.telegram_user_id);
+    }
 
     await event(task.id, "completed", "Task completed");
-    await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} hoàn tất:
-
-${output}`, null, task.telegram_user_id);
+    clearInterval(heartbeatTimer);
+    await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} hoàn tất`, null, task.telegram_user_id);
 
   } catch (err) {
+    try { clearInterval(heartbeatTimer); } catch (_) {}
     const errorText = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    const session = await getOrCreateSession(task.id);
+    const debug = await handleTaskFailure(task, session, errorText, {
+      projectRoot: PROJECT_ROOT,
+      onFirstDebugAttempt: async (msg) => sendTelegramMessage(task.telegram_chat_id, msg, null, task.telegram_user_id),
+    });
 
-    await query(
-      `update hermes_tasks set status='failed', error_text=$1, updated_at=now() where id=$2`,
-      [errorText, task.id]
-    );
+    const enriched = {
+      status: 'failed',
+      error_type: debug.error_type || 'UNKNOWN',
+      debug_attempts: debug.debug_attempts || session.debug_attempts || 0,
+      auto_fix: Boolean(debug.auto_fix),
+      final_state: debug.auto_fix ? 'recovered' : 'failed',
+    };
 
-    await event(task.id, "failed", errorText);
-    await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} bị lỗi:
-${errorText}`, null, task.telegram_user_id);
+    await updateSession(task.id, { status: 'failed', last_error: errorText });
+
+    await failTask(task.id, WORKER_ID, errorText, Boolean(debug.retryable));
+
+    await event(task.id, "failed", errorText, enriched);
+    await sendTelegramMessage(task.telegram_chat_id, `Plan failed at step ${session.current_step_id || '-'}`, null, task.telegram_user_id).catch(()=>{});
+    await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} result:
+${JSON.stringify(enriched)}`, null, task.telegram_user_id);
 
   }
 }
 
 async function loop() {
   try {
+    await upsertWorkerHeartbeat('alive');
+    await recoverStaleTasks();
+    await detectAndHandleStuckTasks().catch(() => {});
+    await checkStuckApprovals().catch(() => {});
+    await checkHighFailureRate().catch(() => {});
+    await runDueGoals().catch(() => {});
     await processOneTask();
   } catch (err) {
     console.error("Worker loop error:", err.message);
