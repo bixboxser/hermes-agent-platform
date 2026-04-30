@@ -13,7 +13,7 @@ services:
       - GIT_AUTHOR_EMAIL=nguyenminhquanlcdn@gmail.com
       - GIT_COMMITTER_NAME=Mason
       - GIT_COMMITTER_EMAIL=nguyenminhquanlcdn@gmail.com
-      - DEEPSEEK_API_KEY=sk-7ab015abefc54c9da4f03a5c8d0b18e9
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DEEPSEEK_MODEL=deepseek-v4-pro
       - OPENAI_API_KEY=dummy_key
       - GITHUB_TOKEN=
@@ -43,7 +43,7 @@ services:
       - GIT_AUTHOR_EMAIL=nguyenminhquanlcdn@gmail.com
       - GIT_COMMITTER_NAME=Mason
       - GIT_COMMITTER_EMAIL=nguyenminhquanlcdn@gmail.com
-      - DEEPSEEK_API_KEY=sk-7ab015abefc54c9da4f03a5c8d0b18e9
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DEEPSEEK_MODEL=deepseek-v4-pro
       - OPENAI_API_KEY=dummy_key
       - GITHUB_TOKEN=
