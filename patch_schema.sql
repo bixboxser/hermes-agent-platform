@@ -1,3 +1,14 @@
+
+create table if not exists telegram_sessions (
+  id serial primary key,
+  telegram_user_id bigint unique,
+  state text,
+  data jsonb default '{}'::jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+create index if not exists telegram_sessions_state_idx on telegram_sessions(state);
+
 create table if not exists hermes_patches (
   id bigserial primary key,
   task_id bigint references hermes_tasks(id) on delete cascade,
