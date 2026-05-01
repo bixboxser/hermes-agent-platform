@@ -35,6 +35,15 @@ let lastWeeklyKey = null;
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+const TELEGRAM_STATES = {
+  IDLE: null,
+  AWAITING_DEPLOY_CHECK: "awaiting_deploy_check",
+  AWAITING_CODEX: "awaiting_codex",
+  AWAITING_REVIEW: "awaiting_review",
+  AWAITING_RECALL: "awaiting_recall",
+  AWAITING_LEARN: "awaiting_learn",
+  AWAITING_AUDIT: "awaiting_audit",
+};
 const ALLOWED_USER_IDS = String(process.env.ALLOWED_USER_IDS || "")
   .split(",")
   .map((id) => Number(id.trim()))
@@ -62,6 +71,133 @@ async function sendTelegramMessage(chatId, text, extra ={}) {
     text,
     ...extra,
   });
+}
+
+
+async function getOrCreateTelegramSession(userId) {
+  const existing = await query(
+    `select * from telegram_sessions where telegram_user_id = $1`,
+    [userId]
+  );
+
+  if (existing.rows[0]) return existing.rows[0];
+
+  await query(
+    `insert into telegram_sessions (telegram_user_id)
+     values ($1)
+     on conflict (telegram_user_id) do nothing`,
+    [userId]
+  );
+
+  const created = await query(
+    `select * from telegram_sessions where telegram_user_id = $1`,
+    [userId]
+  );
+
+  return created.rows[0] || null;
+}
+
+async function setTelegramSessionState(userId, state, data) {
+  if (data === undefined) {
+    await query(
+      `insert into telegram_sessions (telegram_user_id, state, updated_at)
+       values ($1, $2, now())
+       on conflict (telegram_user_id)
+       do update set state = excluded.state, updated_at = now()`,
+      [userId, state]
+    );
+    return;
+  }
+
+  await query(
+    `insert into telegram_sessions (telegram_user_id, state, data, updated_at)
+     values ($1, $2, $3, now())
+     on conflict (telegram_user_id)
+     do update set state = excluded.state, data = excluded.data, updated_at = now()`,
+    [userId, state, data]
+  );
+}
+
+async function clearTelegramSessionState(userId) {
+  await query(
+    `insert into telegram_sessions (telegram_user_id, state, updated_at)
+     values ($1, null, now())
+     on conflict (telegram_user_id)
+     do update set state = null, updated_at = now()`,
+    [userId]
+  );
+}
+
+async function handleTelegramState({ userId, chatId, text, state }) {
+  switch (state) {
+    case TELEGRAM_STATES.AWAITING_DEPLOY_CHECK: {
+      const result = await buildDeployCheck(text);
+      await sendTelegramMessage(chatId, `🚀 Deploy Check:
+
+${result}`);
+      await clearTelegramSessionState(userId);
+      return true;
+    }
+    case TELEGRAM_STATES.AWAITING_CODEX: {
+      const result = await buildCodexPrompt(text);
+      await sendTelegramMessage(chatId, `🛠 Prompt Codex:
+
+${result}`);
+      await clearTelegramSessionState(userId);
+      return true;
+    }
+    case TELEGRAM_STATES.AWAITING_REVIEW: {
+      const result = await reviewCodexResult(text);
+
+      let autoLearnText = "";
+      try {
+        const memory = await learnFromText(result, "auto_review");
+        autoLearnText = `
+
+🧬 Auto Learn: đã lưu vào GBrain
+- ${memory.title}`;
+      } catch (e) {
+        autoLearnText = `
+
+⚠️ Auto Learn lỗi: ${e.message}`;
+      }
+
+      await sendTelegramMessage(chatId, `🔍 Review Patch:
+
+${result}${autoLearnText}`);
+      await clearTelegramSessionState(userId);
+      return true;
+    }
+    case TELEGRAM_STATES.AWAITING_RECALL: {
+      const memories = await recallMemories(text);
+      const reply = memories.length
+        ? memories.map((m) => `🧠 ${m.title}\n${m.summary}\n${m.lesson ? `Lesson: ${m.lesson}` : ""}`).join("\n\n")
+        : "Chưa tìm thấy memory liên quan.";
+
+      await sendTelegramMessage(chatId, reply);
+      await clearTelegramSessionState(userId);
+      return true;
+    }
+    case TELEGRAM_STATES.AWAITING_LEARN: {
+      const memory = await learnFromText(text, "button_learn");
+      await sendTelegramMessage(chatId, `🧬 Đã lưu vào GBrain:
+${memory.title}
+
+${memory.lesson || memory.summary}`);
+      await clearTelegramSessionState(userId);
+      return true;
+    }
+    case TELEGRAM_STATES.AWAITING_AUDIT: {
+      const result = await buildAudit(text);
+      await sendTelegramMessage(chatId, `🧪 Audit:
+
+${result}`);
+      await clearTelegramSessionState(userId);
+      return true;
+    }
+    default:
+      return false;
+  }
 }
 
 async function createGithubIssue(taskText) {
@@ -204,7 +340,7 @@ async function buildDailyReport() {
   let activeSessions = 0;
   try {
     const s = await query(
-      `select count(*)::int as c from hermes_sessions where state is not null`
+      `select count(*)::int as c from telegram_sessions where state is not null`
     );
     activeSessions = s.rows[0]?.c || 0;
   } catch {}
@@ -686,73 +822,43 @@ if (callback) {
 
   if (data === "menu_deploy_check") {
   await sendTelegramMessage(chatId, "🚀 Nhập nội dung cần deploy-check:");
-  await query(
-    `insert into hermes_sessions (telegram_user_id, state)
-     values ($1, 'awaiting_deploy_check')
-     on conflict (telegram_user_id)
-     do update set state = 'awaiting_deploy_check', updated_at = now()`,
-    [callback.from.id]
-  );
+  console.log("FSM_TRANSITION", { userId: callback.from.id, state: TELEGRAM_STATES.AWAITING_DEPLOY_CHECK });
+  await setTelegramSessionState(callback.from.id, TELEGRAM_STATES.AWAITING_DEPLOY_CHECK);
   continue;
 }
 
   if (data === "menu_codex") {
     await sendTelegramMessage(chatId, "🛠 Nhập task cần build prompt Codex:");
-    await query(
-      `insert into hermes_sessions (telegram_user_id, state)
-       values ($1, 'awaiting_codex')
-       on conflict (telegram_user_id)
-       do update set state = 'awaiting_codex', updated_at = now()`,
-      [callbackUserId]
-    );
+    console.log("FSM_TRANSITION", { userId: callbackUserId, state: TELEGRAM_STATES.AWAITING_CODEX });
+    await setTelegramSessionState(callbackUserId, TELEGRAM_STATES.AWAITING_CODEX);
     continue;
   }
 
   if (data === "menu_review") {
     await sendTelegramMessage(chatId, "🔍 Paste kết quả Codex cần review:");
-    await query(
-      `insert into hermes_sessions (telegram_user_id, state)
-       values ($1, 'awaiting_review')
-       on conflict (telegram_user_id)
-       do update set state = 'awaiting_review', updated_at = now()`,
-      [callbackUserId]
-    );
+    console.log("FSM_TRANSITION", { userId: callbackUserId, state: TELEGRAM_STATES.AWAITING_REVIEW });
+    await setTelegramSessionState(callbackUserId, TELEGRAM_STATES.AWAITING_REVIEW);
     continue;
   }
 
   if (data === "menu_recall") {
     await sendTelegramMessage(chatId, "🧠 Nhập từ khóa cần recall:");
-    await query(
-      `insert into hermes_sessions (telegram_user_id, state)
-       values ($1, 'awaiting_recall')
-       on conflict (telegram_user_id)
-       do update set state = 'awaiting_recall', updated_at = now()`,
-      [callbackUserId]
-    );
+    console.log("FSM_TRANSITION", { userId: callbackUserId, state: TELEGRAM_STATES.AWAITING_RECALL });
+    await setTelegramSessionState(callbackUserId, TELEGRAM_STATES.AWAITING_RECALL);
     continue;
   }
 
   if (data === "menu_learn") {
     await sendTelegramMessage(chatId, "🧬 Nhập bài học cần lưu:");
-    await query(
-      `insert into hermes_sessions (telegram_user_id, state)
-       values ($1, 'awaiting_learn')
-       on conflict (telegram_user_id)
-       do update set state = 'awaiting_learn', updated_at = now()`,
-      [callbackUserId]
-    );
+    console.log("FSM_TRANSITION", { userId: callbackUserId, state: TELEGRAM_STATES.AWAITING_LEARN });
+    await setTelegramSessionState(callbackUserId, TELEGRAM_STATES.AWAITING_LEARN);
     continue;
   }
 
   if (data === "menu_audit") {
     await sendTelegramMessage(chatId, "🧪 Nhập vấn đề cần audit:");
-    await query(
-      `insert into hermes_sessions (telegram_user_id, state)
-       values ($1, 'awaiting_audit')
-       on conflict (telegram_user_id)
-       do update set state = 'awaiting_audit', updated_at = now()`,
-      [callbackUserId]
-    );
+    console.log("FSM_TRANSITION", { userId: callbackUserId, state: TELEGRAM_STATES.AWAITING_AUDIT });
+    await setTelegramSessionState(callbackUserId, TELEGRAM_STATES.AWAITING_AUDIT);
     continue;
   }
 
@@ -764,13 +870,8 @@ if (callback) {
   if (data === "menu_codex") {
   await sendTelegramMessage(chatId, "🛠 Nhập task cần build prompt Codex:");
   
-  await query(
-    `insert into hermes_sessions (telegram_user_id, state)
-     values ($1, 'awaiting_codex')
-     on conflict (telegram_user_id)
-     do update set state = 'awaiting_codex'`,
-    [callback.from.id]
-  );
+  console.log("FSM_TRANSITION", { userId: callback.from.id, state: TELEGRAM_STATES.AWAITING_CODEX });
+  await setTelegramSessionState(callback.from.id, TELEGRAM_STATES.AWAITING_CODEX);
 
   continue;
 }    
@@ -885,12 +986,8 @@ Flow chuẩn:
 }
 
       // ===== SESSION HANDLER =====
-const sessionResult = await query(
-  `select state from hermes_sessions where telegram_user_id = $1`,
-  [userId]
-);
-
-const sessionState = sessionResult.rows[0]?.state;
+const session = await getOrCreateTelegramSession(userId);
+const sessionState = session?.state || null;
 
       if (text === "/status") {
   try {
@@ -922,7 +1019,7 @@ const sessionState = sessionResult.rows[0]?.state;
     let activeSessions = 0;
     try {
       const s = await query(
-        `select count(*)::int as c from hermes_sessions where state is not null`
+        `select count(*)::int as c from telegram_sessions where state is not null`
       );
       activeSessions = s.rows[0]?.c || 0;
     } catch {}
@@ -961,82 +1058,11 @@ NEXT ACTION:
   continue;
 }
 
-      if (sessionState === "awaiting_deploy_check") {
-  const result = await buildDeployCheck(text);
-  await sendTelegramMessage(chatId, `🚀 Deploy Check:\n\n${result}`);
-  await query(
-    `update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`,
-    [userId]
-  );
-  continue;
-}
-
-
-if (sessionState === "awaiting_codex") {
-  const result = await buildCodexPrompt(text);
-  await sendTelegramMessage(chatId, `🛠 Prompt Codex:\n\n${result}`);
-  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
-  continue;
-}
-
-if (sessionState === "awaiting_review") {
-  const result = await reviewCodexResult(text);
-
-  let autoLearnText = "";
-  try {
-    const memory = await learnFromText(result, "auto_review");
-    autoLearnText = `\n\n🧬 Auto Learn: đã lưu vào GBrain\n- ${memory.title}`;
-  } catch (e) {
-    autoLearnText = `\n\n⚠️ Auto Learn lỗi: ${e.message}`;
-  }
-
-  await sendTelegramMessage(chatId, `🔍 Review Patch:\n\n${result}${autoLearnText}`);
-  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
-  continue;
-}
-
-if (sessionState === "awaiting_recall") {
-  const memories = await recallMemories(text);
-  const reply = memories.length
-    ? memories.map((m) => `🧠 ${m.title}\n${m.summary}\n${m.lesson ? `Lesson: ${m.lesson}` : ""}`).join("\n\n")
-    : "Chưa tìm thấy memory liên quan.";
-
-  await sendTelegramMessage(chatId, reply);
-  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
-  continue;
-}
-
-if (sessionState === "awaiting_learn") {
-  const memory = await learnFromText(text, "button_learn");
-  await sendTelegramMessage(chatId, `🧬 Đã lưu vào GBrain:\n${memory.title}\n\n${memory.lesson || memory.summary}`);
-  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
-  continue;
-}
-
-if (sessionState === "awaiting_audit") {
-  const result = await buildAudit(text);
-  await sendTelegramMessage(chatId, `🧪 Audit:\n\n${result}`);
-  await query(`update hermes_sessions set state = null, updated_at = now() where telegram_user_id = $1`, [userId]);
-  continue;
-}
-
-      const session = await query(
-  `select state from hermes_sessions where telegram_user_id = $1`,
-  [userId]
-);
-
-if (session.rows[0]?.state === "awaiting_codex") {
-  const result = await buildCodexPrompt(text);
-
-  await sendTelegramMessage(chatId, `🛠 Prompt Codex:\n\n${result}`);
-
-  await query(
-    `update hermes_sessions set state = null where telegram_user_id = $1`,
-    [userId]
-  );
-
-  continue;
-}
+      const handled = await handleTelegramState({ userId, chatId, text, state: sessionState });
+      if (handled) {
+        console.log("FSM_HANDLED", sessionState);
+        continue;
+      }
 
       if (text === "/id") {
         await sendTelegramMessage(chatId, `Telegram user_id của bạn là: ${userId}`);
