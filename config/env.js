@@ -1,8 +1,23 @@
 const path = require('path');
 
-const HERMES_ENV = (process.env.HERMES_ENV || 'dev').toLowerCase();
-if (!['dev', 'prod'].includes(HERMES_ENV)) {
-  throw new Error(`[env] Invalid HERMES_ENV=${HERMES_ENV}. Use dev|prod`);
+const rawAppEnv = (process.env.APP_ENV || '').toLowerCase();
+const rawHermesEnv = (process.env.HERMES_ENV || '').toLowerCase();
+
+let HERMES_ENV = 'dev';
+let APP_ENV = 'development';
+
+if (rawAppEnv) {
+  if (!['development', 'staging', 'production'].includes(rawAppEnv)) {
+    throw new Error(`[env] Invalid APP_ENV=${rawAppEnv}. Use development|staging|production`);
+  }
+  APP_ENV = rawAppEnv;
+  HERMES_ENV = (rawAppEnv === 'production' || rawAppEnv === 'staging') ? 'prod' : 'dev';
+} else {
+  HERMES_ENV = rawHermesEnv || 'dev';
+  if (!['dev', 'prod'].includes(HERMES_ENV)) {
+    throw new Error(`[env] Invalid HERMES_ENV=${HERMES_ENV}. Use dev|prod`);
+  }
+  APP_ENV = HERMES_ENV === 'prod' ? 'production' : 'development';
 }
 
 const projectRootDev = process.env.PROJECT_ROOT_DEV || process.env.PROJECT_ROOT || process.cwd();
@@ -18,8 +33,6 @@ if (HERMES_ENV === 'dev' && projectRoot === prodRoot) {
 const telegramToken = HERMES_ENV === 'prod'
   ? (process.env.TELEGRAM_BOT_TOKEN_PROD || process.env.TELEGRAM_TOKEN)
   : (process.env.TELEGRAM_BOT_TOKEN_DEV || process.env.TELEGRAM_TOKEN);
-
-const APP_ENV = HERMES_ENV === 'prod' ? 'production' : 'development';
 
 function logStartupConfig() {
   console.log(`[env] HERMES_ENV=${HERMES_ENV}`);
