@@ -818,6 +818,37 @@ if (callback) {
       const normalized = text.toLowerCase();
       console.log("INCOMING:", { userId, text });
 
+      await query(
+        `insert into telegram_users (telegram_user_id, is_allowed)
+         values ($1, $2)
+         on conflict (telegram_user_id)
+         do update set last_seen_at = now()`,
+        [userId, isAllowed(userId)]
+      );
+
+      if (!isAllowed(userId)) {
+        await sendTelegramMessage(chatId, "Bạn không có quyền sử dụng Hermes.");
+        continue;
+      }
+
+      if (normalized === "/start") {
+        await sendTelegramMessage(chatId, "👋 Hermes đã sẵn sàng.\n\nGõ /help để xem lệnh.");
+        console.log("COMMAND_HANDLED /start", { userId, chatId });
+        continue;
+      }
+
+      if (normalized === "/help") {
+        await sendTelegramMessage(chatId, "Gõ /commands để xem toàn bộ lệnh Hermes.");
+        console.log("COMMAND_HANDLED /help", { userId, chatId });
+        continue;
+      }
+
+      if (normalized === "/health") {
+        await sendTelegramMessage(chatId, "Hermes app online ✅\nWorker sẽ xử lý task trong nền.");
+        console.log("COMMAND_HANDLED /health", { userId, chatId });
+        continue;
+      }
+
       if (text === "/commands") {
   await sendTelegramMessage(chatId, `📚 Hermes Commands
 
@@ -1007,26 +1038,8 @@ if (session.rows[0]?.state === "awaiting_codex") {
   continue;
 }
 
-      await query(
-        `insert into telegram_users (telegram_user_id, is_allowed)
-         values ($1, $2)
-         on conflict (telegram_user_id)
-         do update set last_seen_at = now()`,
-        [userId, isAllowed(userId)]
-      );
-
       if (text === "/id") {
         await sendTelegramMessage(chatId, `Telegram user_id của bạn là: ${userId}`);
-        continue;
-      }
-
-      if (!isAllowed(userId)) {
-        await sendTelegramMessage(chatId, "Bạn không có quyền sử dụng Hermes.");
-        continue;
-      }
-
-      if (text === "/health") {
-        await sendTelegramMessage(chatId, "Hermes app online ✅\nWorker sẽ xử lý task trong nền.");
         continue;
       }
 
@@ -1542,6 +1555,7 @@ NEXT ACTION:
   
 
 
+      console.log("DEFAULT_TASK_PATH_ENTERED", { userId, chatId, text });
       const taskId = await createTask(chatId, userId, text);
       await sendTelegramMessage(chatId, `Đã nhận task #${taskId}. Hermes đang xử lý...`);
     }
