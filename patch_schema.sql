@@ -19,6 +19,10 @@ create table if not exists hermes_patches (
   approved_at timestamptz,
   applied_at timestamptz
 );
+alter table hermes_task_events add column if not exists metadata jsonb default '{}'::jsonb;
+alter table hermes_task_events add column if not exists sequence_id bigserial;
+create index if not exists idx_hermes_task_events_task_created on hermes_task_events(task_id, created_at);
+create index if not exists idx_hermes_task_events_task_type_created on hermes_task_events(task_id, event_type, created_at);
 
 create table if not exists hermes_approvals (
   id bigserial primary key,
@@ -64,6 +68,25 @@ alter table hermes_tasks add column if not exists locked_at timestamptz;
 alter table hermes_tasks add column if not exists heartbeat_at timestamptz;
 alter table hermes_tasks add column if not exists idempotency_key text;
 alter table hermes_tasks add column if not exists timeout_at timestamptz;
+alter table hermes_tasks add column if not exists approved_by text;
+alter table hermes_tasks add column if not exists approved_at timestamptz;
+alter table hermes_tasks add column if not exists approval_snapshot_hash text;
+alter table hermes_tasks add column if not exists approval_snapshot_payload jsonb default '{}'::jsonb;
+alter table hermes_tasks add column if not exists approval_expires_at timestamptz;
+alter table hermes_tasks add column if not exists result_summary jsonb default '{}'::jsonb;
+alter table hermes_tasks add column if not exists execution_started_at timestamptz;
+alter table hermes_tasks add column if not exists execution_completed_at timestamptz;
+alter table hermes_tasks add column if not exists duration_ms integer;
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname='hermes_tasks_status_check') then
+    alter table if exists hermes_tasks add constraint hermes_tasks_status_check
+      check (status in ('pending','planned','pending_approval','approved','running','completed','failed')) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint where conname='hermes_tasks_idempotency_key_uq') then
+    alter table if exists hermes_tasks add constraint hermes_tasks_idempotency_key_uq unique (idempotency_key);
+  end if;
+end $$;
 
 alter table hermes_approvals add column if not exists payload_hash text;
 alter table hermes_approvals add column if not exists executed_by text;
@@ -135,3 +158,52 @@ create table if not exists hermes_goals (
 alter table hermes_tasks add column if not exists source text;
 alter table hermes_tasks add column if not exists goal_id bigint references hermes_goals(id) on delete set null;
 create index if not exists hermes_goals_status_next_run_idx on hermes_goals(status,next_run_at);
+
+create or replace function hermes_validate_task_status_transition()
+returns trigger as $$
+begin
+  if tg_op = 'UPDATE' and new.status is distinct from old.status then
+    if old.status = 'pending' and new.status <> 'planned' then
+      raise exception 'invalid transition % -> %', old.status, new.status;
+    elsif old.status = 'planned' and new.status <> 'pending_approval' then
+      raise exception 'invalid transition % -> %', old.status, new.status;
+    elsif old.status = 'pending_approval' and new.status not in ('approved','failed') then
+      raise exception 'invalid transition % -> %', old.status, new.status;
+    elsif old.status = 'pending_approval' and new.status = 'approved' and (new.approved_by is null or new.approved_at is null) then
+      raise exception 'approved status requires approved_by and approved_at';
+    elsif old.status = 'approved' and new.status <> 'running' then
+      raise exception 'invalid transition % -> %', old.status, new.status;
+    elsif old.status = 'running' and new.status not in ('completed','failed','planned') then
+      raise exception 'invalid transition % -> %', old.status, new.status;
+    elsif old.status in ('completed','failed') then
+      raise exception 'terminal status cannot transition % -> %', old.status, new.status;
+    end if;
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists hermes_tasks_transition_guard on hermes_tasks;
+create trigger hermes_tasks_transition_guard
+before update on hermes_tasks
+for each row
+execute function hermes_validate_task_status_transition();
+
+create or replace function hermes_log_task_status_change()
+returns trigger as $$
+begin
+  if new.status is distinct from old.status then
+    insert into hermes_task_events(task_id, event_type, message, payload)
+    values (new.id, 'status_transition', old.status || ' -> ' || new.status, jsonb_build_object('from', old.status, 'to', new.status));
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists hermes_tasks_transition_event on hermes_tasks;
+create trigger hermes_tasks_transition_event
+after update on hermes_tasks
+for each row
+execute function hermes_log_task_status_change();
+
+revoke update(status, approved_by, approved_at, locked_by, locked_at, heartbeat_at, timeout_at) on hermes_tasks from public;

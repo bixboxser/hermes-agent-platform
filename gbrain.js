@@ -171,7 +171,13 @@ async function recallMemories(searchText, memoryType = null) {
     [q]
   );
 
-  return result.rows;
+  const now = Date.now();
+  return result.rows.filter((m) => {
+    const ageMs = now - new Date(m.created_at || now).getTime();
+    const stale = ageMs > 1000 * 60 * 60 * 24 * 90;
+    const lowConfidence = String(m.confidence || "medium").toLowerCase() === "low";
+    return !stale && !lowConfidence;
+  });
 }
 
 
@@ -183,7 +189,34 @@ async function recallStructuredMemories(memoryType) {
   if (result.rows.length) {
     await query(`update hermes_memories set last_used_at=now() where id = any($1::bigint[])`, [result.rows.map((r) => r.id)]);
   }
-  return result.rows;
+  const cutoff = Date.now() - 1000 * 60 * 60 * 24 * 90;
+  const filtered = result.rows.filter((r) => {
+    const score = Number(r.confidence ?? 0.7);
+    const updatedAt = new Date(r.updated_at || r.created_at || Date.now()).getTime();
+    return score >= 0.6 && updatedAt >= cutoff;
+  });
+  const seen = new Set();
+  const keyTextMap = new Map();
+  for (const r of filtered) {
+    const key = String(r.memory_key || '').trim().toLowerCase();
+    if (!key) continue;
+    const text = String(r.memory_text || '').trim().toLowerCase();
+    if (!keyTextMap.has(key)) keyTextMap.set(key, new Set());
+    keyTextMap.get(key).add(text);
+  }
+  const conflictingKeys = new Set(
+    Array.from(keyTextMap.entries())
+      .filter(([, values]) => values.size > 1)
+      .map(([k]) => k),
+  );
+  return filtered.filter((r) => {
+    const key = String(r.memory_key || '').trim().toLowerCase();
+    if (key && conflictingKeys.has(key)) return false;
+    if (!key) return true;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 async function runHermesDispatcher(input) {
 
