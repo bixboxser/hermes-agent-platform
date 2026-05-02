@@ -1,6 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const { query } = require("./db");
+const crypto = require("crypto");
 const { getSystemHealth } = require("./dispatcher/health");
 const {
   ensureGBrainSchema,
@@ -68,7 +69,7 @@ function execAsync(cmd) {
 async function sendTelegramMessage(chatId, text, extra ={}) {
   await axios.post(`${TELEGRAM_API}/sendMessage`, {
     chat_id: chatId,
-    text,
+    text: String(text || "").replace(/(token|apikey|authorization|password|bearer)\s*[:=]?\s*[^\s]+/gi, "$1=[REDACTED]").slice(0, 3500),
     ...extra,
   });
 }
@@ -618,22 +619,84 @@ function isAllowed(userId) {
 
 
 async function createTask(chatId, userId, text) {
+  const normalized = String(text || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const dedupeKey = crypto
+    .createHash("sha256")
+    .update(`${userId}:${normalized}`)
+    .digest("hex");
+  const approvalSnapshot = {
+    task_id: null,
+    intent: "execute",
+    normalized_input: normalized,
+    execution_plan: ["parse_intent", "run_gates", "execute_plan"],
+    risk_level: "medium",
+    action_list: ["git status", "npm test", "npm run build"],
+    app_env: process.env.APP_ENV || "development",
+    memory_ids_used: [],
+  };
+
   const result = await query(
-    `insert into hermes_tasks (telegram_chat_id, telegram_user_id, input_text, status)
-     values ($1, $2, $3, 'pending')
+    `insert into hermes_tasks (telegram_chat_id, telegram_user_id, input_text, status, idempotency_key)
+     values ($1, $2, $3, 'planned', $4)
+     on conflict (idempotency_key) do update set updated_at=now()
      returning id`,
-    [chatId, userId, text]
+    [chatId, userId, text, dedupeKey]
   );
 
   const taskId = result.rows[0].id;
+  approvalSnapshot.task_id = taskId;
+  const approvalSnapshotHash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify(approvalSnapshot))
+    .digest("hex");
 
   await query(
     `insert into hermes_task_events (task_id, event_type, message)
      values ($1, 'created', $2)`,
     [taskId, "Task created from Telegram"]
   );
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message)
+     values ($1, 'planned', $2)`,
+    [taskId, "Task moved to planned"]
+  );
+  const plannedToPending = await query(
+    `update hermes_tasks
+     set status='pending_approval',
+         approval_snapshot_hash=$2,
+         approval_snapshot_payload=$3::jsonb,
+         approval_expires_at=now()+interval '15 minutes',
+         updated_at=now()
+     where id=$1 and status='planned'`,
+    [taskId, approvalSnapshotHash, JSON.stringify(approvalSnapshot)],
+  );
+  if ((plannedToPending.rowCount || 0) === 1) {
+    await query(
+    `insert into hermes_task_events (task_id, event_type, message)
+     values ($1, 'pending_approval', $2)`,
+    [taskId, "Task requires explicit approval before running"]
+    );
+  }
 
   return taskId;
+}
+
+async function shouldRateLimitApproval(taskId, userId, actionType) {
+  const r = await query(
+    `select count(*)::int as c
+     from hermes_task_events
+     where task_id=$1
+       and event_type=$2
+       and created_at > now() - interval '5 seconds'
+       and payload->>'callback_user_id' = $3`,
+    [taskId, actionType, String(userId)],
+  );
+  return (r.rows[0]?.c || 0) > 0;
 }
 
 async function createCodeAgentTask(chatId, userId, taskText) {
@@ -893,6 +956,64 @@ if (callback) {
 
   if (data.startsWith("approve_")) {
     const taskId = data.split("_")[1];
+    if (await shouldRateLimitApproval(taskId, callbackUserId, 'approval_rate_limited')) {
+      await sendTelegramMessage(chatId, "⏳ Thao tác quá nhanh, vui lòng đợi vài giây.");
+      continue;
+    }
+    if (!isAllowed(callbackUserId)) {
+      await query(
+        `insert into hermes_task_events (task_id, event_type, message, payload)
+         values ($1, 'approval_rejected', $2, $3)`,
+        [taskId, 'Unauthorized approval callback blocked', { callback_user_id: callbackUserId }],
+      );
+      await sendTelegramMessage(chatId, `❌ Bạn không có quyền duyệt task ${taskId}`);
+      continue;
+    }
+    const taskCheck = await query(
+      `select status, input_text, intent, telegram_chat_id, telegram_user_id, approval_snapshot_hash, approval_snapshot_payload, approval_expires_at
+       from hermes_tasks where id=$1 limit 1`,
+      [taskId],
+    );
+    const t = taskCheck.rows[0];
+    if (!t) {
+      await sendTelegramMessage(chatId, `⚠️ Task ${taskId} không tồn tại.`);
+      continue;
+    }
+    if (t.status !== 'pending_approval') {
+      await sendTelegramMessage(chatId, `ℹ️ Task ${taskId} đã được xử lý trước đó.`);
+      continue;
+    }
+    if (t.approval_expires_at && new Date(t.approval_expires_at).getTime() < Date.now()) {
+      await sendTelegramMessage(chatId, `⛔ Approval cho task ${taskId} đã hết hạn.`);
+      await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'approval_expired',$2,$3)`, [taskId, 'Expired approval rejected', { callback_user_id: callbackUserId }]);
+      continue;
+    }
+    const payload = t.approval_snapshot_payload || {};
+    payload.task_id = Number(taskId);
+    payload.intent = payload.intent || t.intent || "execute";
+    payload.normalized_input = String(t.input_text || "").trim().toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+    payload.app_env = payload.app_env || (process.env.APP_ENV || "development");
+    const expectedHash = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+    if (expectedHash !== t.approval_snapshot_hash) {
+      await sendTelegramMessage(chatId, `⛔ Task ${taskId} đã thay đổi, từ chối duyệt.`);
+      await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'approval_snapshot_mismatch',$2,$3)`, [taskId, 'Approval rejected due to snapshot mismatch', { callback_user_id: callbackUserId }]);
+      continue;
+    }
+    const approved = await query(
+      `update hermes_tasks
+       set status='approved', approved_by=$2, approved_at=now(), updated_at=now()
+       where id=$1 and status='pending_approval'`,
+      [taskId, String(callbackUserId)],
+    );
+    if ((approved.rowCount || 0) !== 1) {
+      await sendTelegramMessage(chatId, `⚠️ Task ${taskId} không ở trạng thái chờ duyệt.`);
+      continue;
+    }
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message)
+       values ($1, 'approved', $2)`,
+      [taskId, "Task approved from Telegram callback"],
+    );
 
     await sendTelegramMessage(chatId, `Đã duyệt task ${taskId}`);
 
@@ -901,10 +1022,27 @@ if (callback) {
 
   if (data.startsWith("reject_")) {
     const taskId = data.split("_")[1];
+    if (!isAllowed(callbackUserId)) {
+      await sendTelegramMessage(chatId, `❌ Bạn không có quyền từ chối task ${taskId}`);
+      continue;
+    }
+    const rej = await query(`update hermes_tasks set status='failed', error_text='Rejected by operator', updated_at=now() where id=$1 and status='pending_approval'`, [taskId]);
+    if ((rej.rowCount || 0) === 1) {
+      await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'rejected',$2,$3)`, [taskId, 'Task rejected from Telegram callback', { callback_user_id: callbackUserId }]);
+    }
 
     await sendTelegramMessage(chatId, `Đã từ chối task ${taskId}`);
 
     await handleAction(`từ chối task ${taskId}`, chatId);
+  }
+  if (data.startsWith("details_")) {
+    const taskId = data.split("_")[1];
+    const task = await query(`select id,input_text,intent,status from hermes_tasks where id=$1`, [taskId]);
+    const t = task.rows[0];
+    if (!t) { await sendTelegramMessage(chatId, "Task không tồn tại."); continue; }
+    const details = `📋 Task ${t.id}\nStatus: ${t.status}\nIntent: ${t.intent || 'unknown'}\n\nPlan:\n- Parse intent\n- Run gated execution plan\n- Execute allowed commands only\n\nCommands:\n- git status\n- npm test/build (nếu cần)\n\nAffected components:\n- worker.js / dispatcher/* / db\n\nRisk:\n- Có thể fail build/test\n- Có thể tạo side-effect nếu task sai ngữ cảnh\n- Ảnh hưởng queue/task execution pipeline`;
+    await sendTelegramMessage(chatId, details);
+    continue;
   }
 
   continue;
@@ -947,6 +1085,32 @@ if (callback) {
       if (normalized === "/health") {
         await sendTelegramMessage(chatId, "Hermes app online ✅\nWorker sẽ xử lý task trong nền.");
         console.log("COMMAND_HANDLED /health", { userId, chatId });
+        continue;
+      }
+      if (normalized.startsWith("/task ")) {
+        const id = Number(text.split(/\s+/)[1]);
+        if (!Number.isInteger(id) || id <= 0) { await sendTelegramMessage(chatId, "Dùng: /task <id_số_nguyên_dương>"); continue; }
+        const tRes = await query(`select id,status,intent,input_text,created_at,updated_at,approved_by,approved_at,result_text,error_text,result_summary from hermes_tasks where id=$1 limit 1`, [id]);
+        const t = tRes.rows[0];
+        if (!t) { await sendTelegramMessage(chatId, `Không tìm thấy task #${id}.`); continue; }
+        const eRes = await query(`select event_type,message,created_at from hermes_task_events where task_id=$1 order by id desc limit 10`, [id]);
+        const events = eRes.rows.reverse().map((e,i)=>`${i+1}. ${e.event_type} — ${String(e.message||'').slice(0,120)}`).join("\n");
+        await sendTelegramMessage(chatId, `📌 Task #${t.id}\n\nStatus: ${t.status}\nIntent: ${t.intent || '-'}\nInput: ${String(t.input_text||'').slice(0,300)}\nApproval: ${t.approved_by ? `approved by ${t.approved_by}` : 'n/a'}\n\nLatest events:\n${events || '-' }\n\nResult: ${String(t.result_text || t.error_text || '-').replace(/(token|apikey|authorization|password|bearer)\s*[:=]?\s*[^\s]+/gi, "$1=[REDACTED]").slice(0,500)}`);
+        continue;
+      }
+      if (normalized.startsWith("/events ")) {
+        const parts = text.split(/\s+/);
+        const id = Number(parts[1]); if (!Number.isInteger(id) || id <= 0) { await sendTelegramMessage(chatId, "Dùng: /events <id> [limit 1-50] [offset>=0]"); continue; }
+        const limit = Math.min(50, Math.max(1, Number(parts[2] || 20)));
+        const offsetArg = Math.max(0, Number(parts[3] || 0));
+        let ev;
+        try {
+          ev = await query(`select id,event_type,message,created_at from hermes_task_events where task_id=$1 order by sequence_id asc nulls last, id asc, created_at asc limit $2 offset $3`, [id, limit, offsetArg]);
+        } catch {
+          ev = await query(`select id,event_type,message,created_at from hermes_task_events where task_id=$1 order by id asc, created_at asc limit $2 offset $3`, [id, limit, offsetArg]);
+        }
+        const msg = ev.rows.map((e,i)=>`${i+1+offsetArg}. ${new Date(e.created_at).toISOString()} — ${e.event_type}\n   ${String(e.message||'').slice(0,120)}`).join("\n\n") || "Không có event.";
+        await sendTelegramMessage(chatId, `🧾 Events for task #${id}\n\n${msg}`);
         continue;
       }
 

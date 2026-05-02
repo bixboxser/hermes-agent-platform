@@ -18,6 +18,7 @@ const { executePlan } = require('./dispatcher/executor');
 const { runDueGoals } = require('./dispatcher/goalRunner');
 
 const rawExecAsync = promisify(exec);
+const crypto = require("crypto");
 
 async function execAsync(command, options = {}) {
   const decision = shouldRequireApproval(command, envConfig.HERMES_ENV);
@@ -72,11 +73,56 @@ async function sendTelegramMessage(chatId, text, buttons = null, telegramUserId 
 }
 
 async function event(taskId, type, message, payload = {}) {
-  await query(
-    `insert into hermes_task_events (task_id, event_type, message, payload)
-     values ($1, $2, $3, $4)`,
-    [taskId, type, message, payload]
-  );
+  try {
+    const safeMessage = String(message || "").replace(/(token|apikey|authorization|password)\s*[:=]\s*[^\s]+/gi, "$1=[REDACTED]").slice(0, 500);
+    const seen = new WeakSet();
+    const safePayload = JSON.parse(JSON.stringify(payload || {}, (_k, v) => {
+      if (typeof v === "bigint") return String(v);
+      if (v instanceof Date) return v.toISOString();
+      if (typeof v === "object" && v !== null) {
+        if (seen.has(v)) return "[Circular]";
+        seen.add(v);
+      }
+      if (v instanceof Error) return { name: v.name, message: String(v.message || "").slice(0, 300) };
+      if (typeof v === "string") return v.replace(/(token|apikey|authorization|password|bearer)\s*[:=]?\s*[^\s]+/gi, "$1=[REDACTED]").slice(0, 1000);
+      return v;
+    }));
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload, metadata)
+       values ($1, $2, $3, $4, $5)`,
+      [taskId, type, safeMessage, safePayload, safePayload]
+    );
+  } catch (e) {
+    console.warn("[event] failed", e.message);
+  }
+}
+
+async function safeNotifyOperator(task, stage, message, metadata = {}) {
+  try {
+    if (!task?.telegram_chat_id) {
+      await event(task?.id || null, 'operator_notification_failed', 'missing_chat_id', { stage, reason: 'missing_chat_id' });
+      return false;
+    }
+    try {
+      await sendTelegramMessage(task.telegram_chat_id, String(message || '').slice(0, 800), null, task.telegram_user_id);
+      await event(task.id, 'operator_notified', `notified:${stage}`, { stage, ...metadata });
+      return true;
+    } catch (e) {
+      await new Promise((r) => setTimeout(r, 300));
+      try {
+        await sendTelegramMessage(task.telegram_chat_id, String(message || '').slice(0, 800), null, task.telegram_user_id);
+        await event(task.id, 'operator_notified', `notified:${stage}`, { stage, retry: true, ...metadata });
+        return true;
+      } catch (e2) {
+        await event(task.id, 'operator_notification_failed', 'telegram_send_failed', { stage, error: String(e2.message || e.message || '').slice(0, 200) });
+        console.warn('[notify] failed', e2.message || e.message);
+        return false;
+      }
+    }
+  } catch (e) {
+    console.warn('[notify] unexpected', e.message);
+    return false;
+  }
 }
 
 async function logAction(taskId, actionName, input, output, status) {
@@ -1085,13 +1131,44 @@ async function processOneTask() {
   if (!task) return;
 
   try {
+    const approvalRes = await query(
+      `select id,status,input_text,intent,telegram_chat_id,telegram_user_id,approval_snapshot_hash,approval_snapshot_payload,approval_expires_at,approved_at
+       from hermes_tasks where id=$1 limit 1`,
+      [task.id],
+    );
+    const approvalTask = approvalRes.rows[0];
+    const snapshotPayload = approvalTask?.approval_snapshot_payload || {};
+    snapshotPayload.task_id = Number(task.id);
+    snapshotPayload.intent = snapshotPayload.intent || approvalTask.intent || 'execute';
+    snapshotPayload.normalized_input = String(approvalTask.input_text || '').trim().toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+    snapshotPayload.app_env = snapshotPayload.app_env || (process.env.APP_ENV || 'development');
+    const calcHash = crypto.createHash('sha256').update(JSON.stringify(snapshotPayload)).digest('hex');
+    if (calcHash !== approvalTask.approval_snapshot_hash) {
+      await event(task.id, "approval_invalidated", "Approval snapshot mismatch before execution");
+      await safeNotifyOperator(task, 'approval_invalidated', `🛑 Task #${task.id}: Approval không còn hợp lệ do task context đã thay đổi.`);
+      await failTask(task.id, WORKER_ID, "approval_invalidated", false);
+      return;
+    }
+    const now = Date.now();
+    const expiry = approvalTask.approval_expires_at ? new Date(approvalTask.approval_expires_at).getTime() : 0;
+    const approvedAt = approvalTask.approved_at ? new Date(approvalTask.approved_at).getTime() : 0;
+    if (!expiry || now >= expiry || !approvedAt || approvedAt >= expiry) {
+      await event(task.id, "approval_expired_before_execution", "Approval expired or invalid timing before execution");
+      await safeNotifyOperator(task, 'approval_expired_before_execution', `🛑 Task #${task.id}: Approval đã hết hạn, không thực thi.`);
+      await failTask(task.id, WORKER_ID, "approval_expired_before_execution", false);
+      return;
+    }
     await upsertWorkerHeartbeat('alive');
     await heartbeatTask(task.id, WORKER_ID);
     const heartbeatTimer = setInterval(() => { heartbeatTask(task.id, WORKER_ID).catch(() => {}); upsertWorkerHeartbeat('alive').catch(() => {}); }, 12000);
     const session = await getOrCreateSession(task.id);
-    await event(task.id, "started", "Worker started task");
+    await event(task.id, "execution_started", "Worker started task");
+    await query(`update hermes_tasks set execution_started_at=now(), updated_at=now() where id=$1`, [task.id]);
 
+    await event(task.id, "plan_started", "Planning started");
     const plan = await createPlanForTask(task);
+    await event(task.id, "plan_created", "Plan created", { plan_id: plan.id });
+    await safeNotifyOperator(task, 'plan_created', `🧠 Task #${task.id}: Đã tạo kế hoạch thực thi.`);
     await executePlan(plan.id);
     const finalResult = { status: 'completed', review_status: 'approved', issues: [], output: null };
     await sendTelegramMessage(task.telegram_chat_id, `Task executed, under review`, null, task.telegram_user_id);
@@ -1101,10 +1178,13 @@ async function processOneTask() {
 
     if (finalResult.review_status === 'approved') {
       await releaseTask(task.id, WORKER_ID, 'completed', JSON.stringify(finalResult));
-      await sendTelegramMessage(task.telegram_chat_id, `Task approved`, null, task.telegram_user_id);
+      await query(`update hermes_tasks set execution_completed_at=now(), duration_ms=extract(epoch from (now()-coalesce(execution_started_at,now())))*1000, result_summary=$2::jsonb where id=$1`, [task.id, JSON.stringify({ task_id: task.id, final_status: 'completed', intent: task.intent || 'execute', approval_status: 'approved', actions_attempted: 0, actions_succeeded: 0, actions_failed: 0, actions: [], key_output: 'Task approved.', safe_error: null, next_operator_action: 'Có thể chạy /task để xem chi tiết.', confidence_level: 'high' })]);
+      await event(task.id, "execution_completed", "Execution completed");
+      await safeNotifyOperator(task, 'execution_completed', `✅ Task #${task.id} hoàn tất.`);
     } else {
       await failTask(task.id, WORKER_ID, (finalResult.issues || []).join('; '), false);
-      await sendTelegramMessage(task.telegram_chat_id, `Task rejected: ${(finalResult.issues || ['unknown']).join('; ')}`, null, task.telegram_user_id);
+      await event(task.id, "execution_failed", "Execution failed", { issues: finalResult.issues || [] });
+      await safeNotifyOperator(task, 'execution_failed', `❌ Task #${task.id} thất bại: ${(finalResult.issues || ['unknown']).join('; ')}`);
     }
 
     await event(task.id, "completed", "Task completed");
