@@ -125,6 +125,36 @@ async function safeNotifyOperator(task, stage, message, metadata = {}) {
   }
 }
 
+async function persistBlockedApprovalFailure(task, safeError, approvalStatus) {
+  const summary = {
+    task_id: task.id,
+    final_status: "failed",
+    intent: task.intent || "execute",
+    approval_status: approvalStatus,
+    actions_attempted: 0,
+    actions_succeeded: 0,
+    actions_failed: 0,
+    actions: [],
+    key_output: null,
+    safe_error: safeError,
+    next_operator_action: "Tạo lại task và duyệt lại trong thời hạn.",
+    confidence_level: "low",
+  };
+  await query(
+    `update hermes_tasks
+     set status='failed',
+         error_text=$2,
+         result_summary=$3::jsonb,
+         execution_completed_at=now(),
+         duration_ms=greatest(0, extract(epoch from (now() - coalesce(execution_started_at, now()))) * 1000)::int,
+         updated_at=now()
+     where id=$1`,
+    [task.id, safeError, JSON.stringify(summary)],
+  );
+  await event(task.id, "failed", safeError, summary);
+  await safeNotifyOperator(task, safeError, `❌ Task #${task.id} failed: ${safeError}\n${JSON.stringify(summary)}`);
+}
+
 async function logAction(taskId, actionName, input, output, status) {
   await query(
     `insert into hermes_action_logs (task_id, action_name, input, output, status)
@@ -1146,6 +1176,7 @@ async function processOneTask() {
     if (calcHash !== approvalTask.approval_snapshot_hash) {
       await event(task.id, "approval_invalidated", "Approval snapshot mismatch before execution");
       await safeNotifyOperator(task, 'approval_invalidated', `🛑 Task #${task.id}: Approval không còn hợp lệ do task context đã thay đổi.`);
+      await persistBlockedApprovalFailure(task, "approval_invalidated", "invalidated");
       await failTask(task.id, WORKER_ID, "approval_invalidated", false);
       return;
     }
@@ -1155,6 +1186,7 @@ async function processOneTask() {
     if (!expiry || now >= expiry || !approvedAt || approvedAt >= expiry) {
       await event(task.id, "approval_expired_before_execution", "Approval expired or invalid timing before execution");
       await safeNotifyOperator(task, 'approval_expired_before_execution', `🛑 Task #${task.id}: Approval đã hết hạn, không thực thi.`);
+      await persistBlockedApprovalFailure(task, "approval_expired_before_execution", "expired");
       await failTask(task.id, WORKER_ID, "approval_expired_before_execution", false);
       return;
     }

@@ -18,9 +18,9 @@ async function getSystemHealth() {
   );
   const oldest = await query(
     `select
-      extract(epoch from (now() - min(created_at)))::int filter (where status='pending') as oldest_pending_seconds,
-      extract(epoch from (now() - min(created_at)))::int filter (where status='pending_approval') as oldest_pending_approval_seconds
-     from hermes_tasks where status in ('pending','pending_approval')`,
+      coalesce(extract(epoch from (now() - min(case when status='pending' then created_at end)))::int, 0) as oldest_pending_seconds,
+      coalesce(extract(epoch from (now() - min(case when status='pending_approval' then created_at end)))::int, 0) as oldest_pending_approval_seconds
+     from hermes_tasks`,
   );
   const stuck = await query(
     `select count(*)::int as c from hermes_tasks where status='running' and heartbeat_at < now() - interval '10 minutes'`,
