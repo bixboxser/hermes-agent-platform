@@ -19,10 +19,10 @@ async function getSystemHealth() {
 
   const q = await query(
     `select
-      sum(case when status='pending' then 1 else 0 end)::int as pending,
-      sum(case when status='running' then 1 else 0 end)::int as running,
-      sum(case when status='failed' then 1 else 0 end)::int as failed,
-      sum(case when status='pending_approval' then 1 else 0 end)::int as waiting_approval
+      coalesce(sum(case when status='pending' then 1 else 0 end), 0)::int as pending,
+      coalesce(sum(case when status='running' then 1 else 0 end), 0)::int as running,
+      coalesce(sum(case when status='failed' then 1 else 0 end), 0)::int as failed,
+      coalesce(sum(case when status='pending_approval' then 1 else 0 end), 0)::int as waiting_approval
      from hermes_tasks`
   );
 
