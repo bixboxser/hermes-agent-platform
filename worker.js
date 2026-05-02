@@ -18,7 +18,7 @@ const { executePlan } = require('./dispatcher/executor');
 const { runDueGoals } = require('./dispatcher/goalRunner');
 
 const rawExecAsync = promisify(exec);
-const crypto = require("crypto");
+const { canonicalizeApprovalSnapshot, hashApprovalSnapshot } = require('./approvalSnapshot');
 
 async function execAsync(command, options = {}) {
   const decision = shouldRequireApproval(command, envConfig.HERMES_ENV);
@@ -1167,14 +1167,21 @@ async function processOneTask() {
       [task.id],
     );
     const approvalTask = approvalRes.rows[0];
-    const snapshotPayload = approvalTask?.approval_snapshot_payload || {};
-    snapshotPayload.task_id = Number(task.id);
-    snapshotPayload.intent = snapshotPayload.intent || approvalTask.intent || 'execute';
-    snapshotPayload.normalized_input = String(approvalTask.input_text || '').trim().toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-    snapshotPayload.app_env = snapshotPayload.app_env || (process.env.APP_ENV || 'development');
-    const calcHash = crypto.createHash('sha256').update(JSON.stringify(snapshotPayload)).digest('hex');
+    const canonicalSnapshotPayload = canonicalizeApprovalSnapshot({
+      taskId: task.id,
+      payload: approvalTask?.approval_snapshot_payload || {},
+      inputText: approvalTask?.input_text,
+      intent: approvalTask?.intent || 'execute',
+      appEnv: process.env.APP_ENV || 'development',
+    });
+    const calcHash = hashApprovalSnapshot(canonicalSnapshotPayload);
     if (calcHash !== approvalTask.approval_snapshot_hash) {
-      await event(task.id, "approval_invalidated", "Approval snapshot mismatch before execution");
+      await event(task.id, "approval_invalidated", "Approval snapshot mismatch before execution", {
+        stored_hash_short: String(approvalTask.approval_snapshot_hash || '').slice(0, 12),
+        recomputed_hash_short: String(calcHash || '').slice(0, 12),
+        stored_task_id_type: typeof (approvalTask?.approval_snapshot_payload || {}).task_id,
+        canonical_task_id_type: typeof canonicalSnapshotPayload.task_id,
+      });
       await safeNotifyOperator(task, 'approval_invalidated', `🛑 Task #${task.id}: Approval không còn hợp lệ do task context đã thay đổi.`);
       await persistBlockedApprovalFailure(task, "approval_invalidated", "invalidated");
       await failTask(task.id, WORKER_ID, "approval_invalidated", false);
