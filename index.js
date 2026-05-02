@@ -681,6 +681,40 @@ async function createTask(chatId, userId, text) {
      values ($1, 'pending_approval', $2)`,
     [taskId, "Task requires explicit approval before running"]
     );
+    const actionList = Array.isArray(approvalSnapshot.action_list) ? approvalSnapshot.action_list.join(", ") : "-";
+    const shortHash = approvalSnapshotHash ? approvalSnapshotHash.slice(0, 12) : "-";
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    const approvalMessage = [
+      `🛂 Task #${taskId} cần duyệt`,
+      `Intent: ${approvalSnapshot.intent || "-"}`,
+      `Input: ${String(text || "").slice(0, 500) || "-"}`,
+      `Risk: ${approvalSnapshot.risk_level || "-"}`,
+      `Expires: ${expiresAt}`,
+      `Snapshot: ${shortHash}`,
+      `Actions: ${actionList || "-"}`,
+    ].join("\n");
+    try {
+      await sendTelegramMessage(chatId, approvalMessage, {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ Duyệt", callback_data: `approve_${taskId}` },
+            { text: "❌ Từ chối", callback_data: `reject_${taskId}` },
+          ]],
+        },
+      });
+      await query(
+        `insert into hermes_task_events (task_id, event_type, message)
+         values ($1, 'operator_notified', $2)`,
+        [taskId, "Approval request sent to operator"],
+      );
+    } catch (e) {
+      console.warn("[approval notify] failed", e.message);
+      await query(
+        `insert into hermes_task_events (task_id, event_type, message, payload)
+         values ($1, 'operator_notification_failed', $2, $3)`,
+        [taskId, "Failed to send approval request", { error: String(e.message || "").slice(0, 200) }],
+      );
+    }
   }
 
   return taskId;
@@ -697,6 +731,54 @@ async function shouldRateLimitApproval(taskId, userId, actionType) {
     [taskId, actionType, String(userId)],
   );
   return (r.rows[0]?.c || 0) > 0;
+}
+
+async function handleApprovalDecision({ taskId, actorUserId, chatId, action }) {
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    await sendTelegramMessage(chatId, "Dùng: /approve <id_số_nguyên_dương> hoặc /reject <id_số_nguyên_dương>");
+    return;
+  }
+  if (!isAllowed(actorUserId)) {
+    await sendTelegramMessage(chatId, `❌ Bạn không có quyền ${action === "approve" ? "duyệt" : "từ chối"} task ${taskId}`);
+    return;
+  }
+  const taskCheck = await query(
+    `select status, input_text, intent, approval_snapshot_hash, approval_snapshot_payload, approval_expires_at
+     from hermes_tasks where id=$1 limit 1`,
+    [taskId],
+  );
+  const t = taskCheck.rows[0];
+  if (!t) { await sendTelegramMessage(chatId, `⚠️ Task ${taskId} không tồn tại.`); return; }
+  if (t.status !== 'pending_approval') { await sendTelegramMessage(chatId, `ℹ️ Task ${taskId} đã được xử lý trước đó.`); return; }
+  if (t.approval_expires_at && new Date(t.approval_expires_at).getTime() < Date.now()) {
+    await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'approval_expired',$2,$3)`, [taskId, 'Expired approval rejected', { callback_user_id: actorUserId }]);
+    await sendTelegramMessage(chatId, `⛔ Approval cho task ${taskId} đã hết hạn.`);
+    return;
+  }
+  const payload = t.approval_snapshot_payload || {};
+  payload.task_id = Number(taskId);
+  payload.intent = payload.intent || t.intent || "execute";
+  payload.normalized_input = String(t.input_text || "").trim().toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+  payload.app_env = payload.app_env || (process.env.APP_ENV || "development");
+  const expectedHash = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+  if (expectedHash !== t.approval_snapshot_hash) {
+    await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'approval_snapshot_mismatch',$2,$3)`, [taskId, 'Approval rejected due to snapshot mismatch', { callback_user_id: actorUserId }]);
+    await sendTelegramMessage(chatId, `⛔ Task ${taskId} đã thay đổi, không thể ${action === "approve" ? "duyệt" : "từ chối"} theo snapshot cũ.`);
+    return;
+  }
+
+  if (action === "approve") {
+    const approved = await query(`update hermes_tasks set status='approved', approved_by=$2, approved_at=now(), updated_at=now() where id=$1 and status='pending_approval'`, [taskId, String(actorUserId)]);
+    if ((approved.rowCount || 0) !== 1) { await sendTelegramMessage(chatId, `⚠️ Task ${taskId} không ở trạng thái chờ duyệt.`); return; }
+    await query(`insert into hermes_task_events (task_id, event_type, message) values ($1, 'approved', $2)`, [taskId, "Task approved from Telegram"]);
+    await sendTelegramMessage(chatId, `✅ Đã duyệt task ${taskId}`);
+    return;
+  }
+  const rej = await query(`update hermes_tasks set status='failed', error_text='Rejected by operator', updated_at=now() where id=$1 and status='pending_approval'`, [taskId]);
+  if ((rej.rowCount || 0) === 1) {
+    await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'rejected',$2,$3)`, [taskId, 'Task rejected from Telegram', { callback_user_id: actorUserId }]);
+  }
+  await sendTelegramMessage(chatId, `❌ Đã từ chối task ${taskId}`);
 }
 
 async function createCodeAgentTask(chatId, userId, taskText) {
@@ -955,85 +1037,17 @@ if (callback) {
   }
 
   if (data.startsWith("approve_")) {
-    const taskId = data.split("_")[1];
+    const taskId = Number(data.split("_")[1]);
     if (await shouldRateLimitApproval(taskId, callbackUserId, 'approval_rate_limited')) {
       await sendTelegramMessage(chatId, "⏳ Thao tác quá nhanh, vui lòng đợi vài giây.");
       continue;
     }
-    if (!isAllowed(callbackUserId)) {
-      await query(
-        `insert into hermes_task_events (task_id, event_type, message, payload)
-         values ($1, 'approval_rejected', $2, $3)`,
-        [taskId, 'Unauthorized approval callback blocked', { callback_user_id: callbackUserId }],
-      );
-      await sendTelegramMessage(chatId, `❌ Bạn không có quyền duyệt task ${taskId}`);
-      continue;
-    }
-    const taskCheck = await query(
-      `select status, input_text, intent, telegram_chat_id, telegram_user_id, approval_snapshot_hash, approval_snapshot_payload, approval_expires_at
-       from hermes_tasks where id=$1 limit 1`,
-      [taskId],
-    );
-    const t = taskCheck.rows[0];
-    if (!t) {
-      await sendTelegramMessage(chatId, `⚠️ Task ${taskId} không tồn tại.`);
-      continue;
-    }
-    if (t.status !== 'pending_approval') {
-      await sendTelegramMessage(chatId, `ℹ️ Task ${taskId} đã được xử lý trước đó.`);
-      continue;
-    }
-    if (t.approval_expires_at && new Date(t.approval_expires_at).getTime() < Date.now()) {
-      await sendTelegramMessage(chatId, `⛔ Approval cho task ${taskId} đã hết hạn.`);
-      await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'approval_expired',$2,$3)`, [taskId, 'Expired approval rejected', { callback_user_id: callbackUserId }]);
-      continue;
-    }
-    const payload = t.approval_snapshot_payload || {};
-    payload.task_id = Number(taskId);
-    payload.intent = payload.intent || t.intent || "execute";
-    payload.normalized_input = String(t.input_text || "").trim().toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
-    payload.app_env = payload.app_env || (process.env.APP_ENV || "development");
-    const expectedHash = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
-    if (expectedHash !== t.approval_snapshot_hash) {
-      await sendTelegramMessage(chatId, `⛔ Task ${taskId} đã thay đổi, từ chối duyệt.`);
-      await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'approval_snapshot_mismatch',$2,$3)`, [taskId, 'Approval rejected due to snapshot mismatch', { callback_user_id: callbackUserId }]);
-      continue;
-    }
-    const approved = await query(
-      `update hermes_tasks
-       set status='approved', approved_by=$2, approved_at=now(), updated_at=now()
-       where id=$1 and status='pending_approval'`,
-      [taskId, String(callbackUserId)],
-    );
-    if ((approved.rowCount || 0) !== 1) {
-      await sendTelegramMessage(chatId, `⚠️ Task ${taskId} không ở trạng thái chờ duyệt.`);
-      continue;
-    }
-    await query(
-      `insert into hermes_task_events (task_id, event_type, message)
-       values ($1, 'approved', $2)`,
-      [taskId, "Task approved from Telegram callback"],
-    );
-
-    await sendTelegramMessage(chatId, `Đã duyệt task ${taskId}`);
-
-    await handleAction(`duyệt task ${taskId}`, chatId);
+    await handleApprovalDecision({ taskId, actorUserId: callbackUserId, chatId, action: "approve" });
   }
 
   if (data.startsWith("reject_")) {
-    const taskId = data.split("_")[1];
-    if (!isAllowed(callbackUserId)) {
-      await sendTelegramMessage(chatId, `❌ Bạn không có quyền từ chối task ${taskId}`);
-      continue;
-    }
-    const rej = await query(`update hermes_tasks set status='failed', error_text='Rejected by operator', updated_at=now() where id=$1 and status='pending_approval'`, [taskId]);
-    if ((rej.rowCount || 0) === 1) {
-      await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'rejected',$2,$3)`, [taskId, 'Task rejected from Telegram callback', { callback_user_id: callbackUserId }]);
-    }
-
-    await sendTelegramMessage(chatId, `Đã từ chối task ${taskId}`);
-
-    await handleAction(`từ chối task ${taskId}`, chatId);
+    const taskId = Number(data.split("_")[1]);
+    await handleApprovalDecision({ taskId, actorUserId: callbackUserId, chatId, action: "reject" });
   }
   if (data.startsWith("details_")) {
     const taskId = data.split("_")[1];
@@ -1111,6 +1125,18 @@ if (callback) {
         }
         const msg = ev.rows.map((e,i)=>`${i+1+offsetArg}. ${new Date(e.created_at).toISOString()} — ${e.event_type}\n   ${String(e.message||'').slice(0,120)}`).join("\n\n") || "Không có event.";
         await sendTelegramMessage(chatId, `🧾 Events for task #${id}\n\n${msg}`);
+        continue;
+      }
+      if (normalized.startsWith("/approve")) {
+        const id = Number(text.split(/\s+/)[1]);
+        if (!Number.isInteger(id) || id <= 0) { await sendTelegramMessage(chatId, "Dùng: /approve <id_số_nguyên_dương>"); continue; }
+        await handleApprovalDecision({ taskId: id, actorUserId: userId, chatId, action: "approve" });
+        continue;
+      }
+      if (normalized.startsWith("/reject")) {
+        const id = Number(text.split(/\s+/)[1]);
+        if (!Number.isInteger(id) || id <= 0) { await sendTelegramMessage(chatId, "Dùng: /reject <id_số_nguyên_dương>"); continue; }
+        await handleApprovalDecision({ taskId: id, actorUserId: userId, chatId, action: "reject" });
         continue;
       }
 
