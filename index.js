@@ -1,7 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const { query } = require("./db");
-const crypto = require("crypto");
+const { canonicalizeApprovalSnapshot, hashApprovalSnapshot, normalizeInputText } = require("./approvalSnapshot");
 const { getSystemHealth } = require("./dispatcher/health");
 const {
   ensureGBrainSchema,
@@ -619,26 +619,25 @@ function isAllowed(userId) {
 
 
 async function createTask(chatId, userId, text) {
-  const normalized = String(text || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const normalized = normalizeInputText(text);
   const dedupeKey = crypto
     .createHash("sha256")
     .update(`${userId}:${normalized}`)
     .digest("hex");
-  const approvalSnapshot = {
-    task_id: null,
+  const approvalSnapshot = canonicalizeApprovalSnapshot({
+    taskId: "",
+    payload: {
+      intent: "execute",
+      normalized_input: normalized,
+      execution_plan: ["parse_intent", "run_gates", "execute_plan"],
+      risk_level: "medium",
+      action_list: ["git status", "npm test", "npm run build"],
+      memory_ids_used: [],
+    },
+    inputText: text,
     intent: "execute",
-    normalized_input: normalized,
-    execution_plan: ["parse_intent", "run_gates", "execute_plan"],
-    risk_level: "medium",
-    action_list: ["git status", "npm test", "npm run build"],
-    app_env: process.env.APP_ENV || "development",
-    memory_ids_used: [],
-  };
+    appEnv: process.env.APP_ENV || "development",
+  });
 
   const result = await query(
     `insert into hermes_tasks (telegram_chat_id, telegram_user_id, input_text, status, idempotency_key)
@@ -649,11 +648,14 @@ async function createTask(chatId, userId, text) {
   );
 
   const taskId = result.rows[0].id;
-  approvalSnapshot.task_id = taskId;
-  const approvalSnapshotHash = crypto
-    .createHash("sha256")
-    .update(JSON.stringify(approvalSnapshot))
-    .digest("hex");
+  const canonicalApprovalSnapshot = canonicalizeApprovalSnapshot({
+    taskId,
+    payload: approvalSnapshot,
+    inputText: text,
+    intent: "execute",
+    appEnv: process.env.APP_ENV || "development",
+  });
+  const approvalSnapshotHash = hashApprovalSnapshot(canonicalApprovalSnapshot);
 
   await query(
     `insert into hermes_task_events (task_id, event_type, message)
@@ -673,7 +675,7 @@ async function createTask(chatId, userId, text) {
          approval_expires_at=now()+interval '15 minutes',
          updated_at=now()
      where id=$1 and status='planned'`,
-    [taskId, approvalSnapshotHash, JSON.stringify(approvalSnapshot)],
+    [taskId, approvalSnapshotHash, JSON.stringify(canonicalApprovalSnapshot)],
   );
   if ((plannedToPending.rowCount || 0) === 1) {
     await query(
@@ -755,14 +757,16 @@ async function handleApprovalDecision({ taskId, actorUserId, chatId, action }) {
     await sendTelegramMessage(chatId, `⛔ Approval cho task ${taskId} đã hết hạn.`);
     return;
   }
-  const payload = t.approval_snapshot_payload || {};
-  payload.task_id = Number(taskId);
-  payload.intent = payload.intent || t.intent || "execute";
-  payload.normalized_input = String(t.input_text || "").trim().toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
-  payload.app_env = payload.app_env || (process.env.APP_ENV || "development");
-  const expectedHash = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+  const canonicalPayload = canonicalizeApprovalSnapshot({
+    taskId,
+    payload: t.approval_snapshot_payload || {},
+    inputText: t.input_text,
+    intent: t.intent || "execute",
+    appEnv: process.env.APP_ENV || "development",
+  });
+  const expectedHash = hashApprovalSnapshot(canonicalPayload);
   if (expectedHash !== t.approval_snapshot_hash) {
-    await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'approval_snapshot_mismatch',$2,$3)`, [taskId, 'Approval rejected due to snapshot mismatch', { callback_user_id: actorUserId }]);
+    await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'approval_snapshot_mismatch',$2,$3)`, [taskId, 'Approval rejected due to snapshot mismatch', { callback_user_id: actorUserId, stored_hash_short: String(t.approval_snapshot_hash || '').slice(0, 12), recomputed_hash_short: String(expectedHash || '').slice(0, 12), stored_task_id_type: typeof (t.approval_snapshot_payload || {}).task_id, canonical_task_id_type: typeof canonicalPayload.task_id }]);
     await sendTelegramMessage(chatId, `⛔ Task ${taskId} đã thay đổi, không thể ${action === "approve" ? "duyệt" : "từ chối"} theo snapshot cũ.`);
     return;
   }
