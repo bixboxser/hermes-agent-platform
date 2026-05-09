@@ -1,10 +1,10 @@
-import * as crypto from 'crypto';
+import * as nodeCrypto from 'crypto';
 import { logEvent } from './events';
 import { validateTransition } from './fsm';
 import { Queryable, TaskStatus } from './types';
 
 function hashPayload(payload: unknown): string {
-  return crypto.createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
+  return nodeCrypto.createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
 }
 
 async function updateStatusTx(db: Queryable, taskId: number, from: TaskStatus, to: TaskStatus): Promise<void> {
@@ -14,7 +14,7 @@ async function updateStatusTx(db: Queryable, taskId: number, from: TaskStatus, t
 }
 
 export async function createCommandApproval(db: Queryable, taskId: number, actionType: string, riskLevel: string, payload: unknown = {}): Promise<string> {
-  const token = crypto.randomBytes(16).toString('hex');
+  const token = nodeCrypto.randomBytes(16).toString('hex');
   const payloadHash = hashPayload(payload);
   await db.query(
     `insert into hermes_approvals (task_id,status,action_type,risk_level,approval_token,expires_at,payload_hash)

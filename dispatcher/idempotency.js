@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+const nodeCrypto = require('node:crypto');
 const { query } = require('../db');
 
 function stableStringify(obj) {
@@ -8,7 +8,7 @@ function stableStringify(obj) {
 }
 
 function hashPayload(payload) {
-  return crypto.createHash('sha256').update(stableStringify(payload || {})).digest('hex');
+  return nodeCrypto.createHash('sha256').update(stableStringify(payload || {})).digest('hex');
 }
 
 async function getExistingIdempotentAction(key) {

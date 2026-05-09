@@ -8,6 +8,9 @@ const {
   ensureGBrainSchema,
   learnFromText,
   recallMemories,
+  rememberOperatorMemory,
+  recallOperatorMemories,
+  getOperatorMemoryStats,
   runDispatcher,
   buildCodexPrompt,
   reviewCodexResult,
@@ -676,6 +679,168 @@ function buildUnknownTelegramReply(text) {
   ].join("\n");
 }
 
+
+function redactSensitiveText(value) {
+  return String(value || "")
+    .replace(/(token|apikey|api_key|authorization|password|bearer|secret)\s*[:=]?\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .replace(/postgres(?:ql)?:\/\/[^\s@]+@/gi, "postgres://[REDACTED]@");
+}
+
+function truncateForTelegram(value, max = 500) {
+  const text = redactSensitiveText(value).replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function formatAge(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  if (!total) return "-";
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes || 1}m`;
+}
+
+function parsePositiveIntegerArg(text, command) {
+  const raw = String(text || "").trim().split(/\s+/)[1];
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) {
+    return { error: `Dùng: ${command} <id_số_nguyên_dương>` };
+  }
+  return { id };
+}
+
+async function buildTelegramStatusMessage() {
+  const health = await getSystemHealth();
+  const latest = health.latest_task;
+  const latestLine = latest
+    ? `#${latest.id} ${latest.status} — ${truncateForTelegram(latest.input_text, 80)}`
+    : "-";
+  const workerAge = health.worker.last_heartbeat_at
+    ? formatAge(Math.floor((Date.now() - new Date(health.worker.last_heartbeat_at).getTime()) / 1000))
+    : "-";
+  const warnings = (health.warnings || []).slice(0, 2).map((w) => `- Warning: ${truncateForTelegram(w, 120)}`);
+
+  return [
+    "Hermes Status",
+    `- App: ${health.app?.ok ? "OK" : "WARN"}`,
+    `- DB: ${health.db?.ok ? "OK" : "DOWN"}`,
+    `- Worker: ${health.worker?.alive ? "OK" : "UNKNOWN"}${workerAge !== "-" ? ` (heartbeat ${workerAge} ago)` : ""}`,
+    `- Env: ${health.app_env || "development"} / ${health.env || "dev"}`,
+    `- Project: ${truncateForTelegram(health.projectRoot || "-", 120)}`,
+    `- Pending: ${health.queue.pending}`,
+    `- Planned: ${health.queue.planned}`,
+    `- Pending approval: ${health.queue.pending_approval}`,
+    `- Approved: ${health.queue.approved}`,
+    `- Running: ${health.queue.running}`,
+    `- Completed 24h: ${health.queue.completed_24h}`,
+    `- Failed 24h: ${health.queue.failed_24h}`,
+    `- Oldest pending: ${formatAge(health.queue.oldest_pending_seconds)}`,
+    `- Oldest approval: ${formatAge(health.queue.oldest_pending_approval_seconds)}`,
+    `- Latest task: ${latestLine}`,
+    ...warnings,
+  ].join("\n");
+}
+
+async function buildTelegramTaskMessage(text) {
+  const parsed = parsePositiveIntegerArg(text, "/task");
+  if (parsed.error) return parsed.error;
+  const id = parsed.id;
+  const tRes = await query(
+    `select id,status,intent,input_text,created_at,updated_at,approval_expires_at,approved_by,approved_at,result_text,error_text,result_summary
+     from hermes_tasks
+     where id=$1
+     limit 1`,
+    [id],
+  );
+  const t = tRes.rows[0];
+  if (!t) return `Không tìm thấy task #${id}.`;
+  const result = t.result_text || (t.result_summary ? JSON.stringify(t.result_summary) : "");
+  return [
+    `Task #${t.id}`,
+    `- Status: ${t.status}`,
+    `- Intent: ${t.intent || "-"}`,
+    `- Input: ${truncateForTelegram(t.input_text, 500)}`,
+    `- Created: ${t.created_at ? new Date(t.created_at).toISOString() : "-"}`,
+    `- Updated: ${t.updated_at ? new Date(t.updated_at).toISOString() : "-"}`,
+    `- Approval expires: ${t.approval_expires_at ? new Date(t.approval_expires_at).toISOString() : "-"}`,
+    `- Approved by: ${t.approved_by || "-"}`,
+    `- Approved at: ${t.approved_at ? new Date(t.approved_at).toISOString() : "-"}`,
+    result ? `- Result: ${truncateForTelegram(result, 700)}` : null,
+    t.error_text ? `- Error: ${truncateForTelegram(t.error_text, 700)}` : null,
+  ].filter(Boolean).join("\n");
+}
+
+async function buildTelegramEventsMessage(text) {
+  const parsed = parsePositiveIntegerArg(text, "/events");
+  if (parsed.error) return parsed.error;
+  const id = parsed.id;
+  const taskExists = await query(`select id from hermes_tasks where id=$1 limit 1`, [id]);
+  if (!taskExists.rows[0]) return `Không tìm thấy task #${id}.`;
+  let ev;
+  try {
+    ev = await query(
+      `select id,event_type,message,payload,metadata,created_at
+       from hermes_task_events
+       where task_id=$1
+       order by sequence_id desc nulls last, created_at desc, id desc
+       limit 12`,
+      [id],
+    );
+  } catch {
+    ev = await query(
+      `select id,event_type,message,payload,metadata,created_at
+       from hermes_task_events
+       where task_id=$1
+       order by created_at desc, id desc
+       limit 12`,
+      [id],
+    );
+  }
+  if (!ev.rows.length) return `Task #${id} chưa có event.`;
+  const rows = ev.rows.reverse().map((e) => {
+    const detail = e.message || JSON.stringify(e.metadata || e.payload || {});
+    return `- ${new Date(e.created_at).toISOString()} — ${e.event_type}: ${truncateForTelegram(detail, 180)}`;
+  });
+  return [`Events for task #${id}`, ...rows].join("\n");
+}
+
+async function buildRememberMessage(text) {
+  const memoryText = String(text || "").replace(/^\/remember\b/i, "").trim();
+  if (!memoryText) return "Dùng: /remember <thing Hermes should remember>";
+  const memory = await rememberOperatorMemory(memoryText, "telegram_operator");
+  return [
+    "Memory stored ✅",
+    `- ID: ${memory.id || "-"}`,
+    `- Type: ${memory.memory_type || "project_context"}`,
+    `- Summary: ${truncateForTelegram(memory.memory_text, 240)}`,
+    "- Retrieval: use /recall <keyword>",
+  ].join("\n");
+}
+
+async function buildRecallMessage(text) {
+  const keyword = String(text || "").replace(/^\/recall\b/i, "").trim();
+  if (!keyword) return "Dùng: /recall <keyword>";
+  const memories = await recallOperatorMemories(keyword, 5);
+  if (!memories.length) return "No matching memory found.";
+  return [
+    `Memory recall for: ${truncateForTelegram(keyword, 80)}`,
+    ...memories.map((m) => `- #${m.id} [${m.memory_type || "memory"}] ${truncateForTelegram(m.memory_text, 260)}`),
+  ].join("\n");
+}
+
+async function buildMemoryStatsMessage() {
+  const stats = await getOperatorMemoryStats();
+  const byType = stats.by_type.length
+    ? stats.by_type.map((r) => `- ${r.memory_type}: ${r.count}`).join("\n")
+    : "- none: 0";
+  return [
+    "Memory Stats",
+    `- Total: ${stats.total}`,
+    `- Latest: ${stats.latest_memory_at ? new Date(stats.latest_memory_at).toISOString() : "-"}`,
+    byType,
+  ].join("\n");
+}
+
 function isAllowed(userId) {
   return ALLOWED_USER_IDS.includes(Number(userId));
 }
@@ -1138,17 +1303,31 @@ if (callback) {
       const normalized = text.toLowerCase();
       console.log("INCOMING:", { userId, text });
 
-      await query(
-        `insert into telegram_users (telegram_user_id, is_allowed)
-         values ($1, $2)
-         on conflict (telegram_user_id)
-         do update set last_seen_at = now()`,
-        [userId, isAllowed(userId)]
-      );
-
       if (!isAllowed(userId)) {
         await sendTelegramMessage(chatId, "Bạn không có quyền sử dụng Hermes.");
         continue;
+      }
+
+      if (normalized === "/status") {
+        try {
+          await sendTelegramMessage(chatId, await buildTelegramStatusMessage());
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Hermes Status\n- App: WARN\n- DB: DOWN or unavailable\n- Warning: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /status", { userId, chatId });
+        continue;
+      }
+
+      try {
+        await query(
+          `insert into telegram_users (telegram_user_id, is_allowed)
+           values ($1, $2)
+           on conflict (telegram_user_id)
+           do update set last_seen_at = now()`,
+          [userId, isAllowed(userId)]
+        );
+      } catch (err) {
+        console.warn("telegram user upsert failed:", err.message);
       }
 
       if (normalized === "/start") {
@@ -1168,32 +1347,56 @@ if (callback) {
         console.log("COMMAND_HANDLED /health", { userId, chatId });
         continue;
       }
-      if (normalized.startsWith("/task ")) {
-        const id = Number(text.split(/\s+/)[1]);
-        if (!Number.isInteger(id) || id <= 0) { await sendTelegramMessage(chatId, "Dùng: /task <id_số_nguyên_dương>"); continue; }
-        const tRes = await query(`select id,status,intent,input_text,created_at,updated_at,approved_by,approved_at,result_text,error_text,result_summary from hermes_tasks where id=$1 limit 1`, [id]);
-        const t = tRes.rows[0];
-        if (!t) { await sendTelegramMessage(chatId, `Không tìm thấy task #${id}.`); continue; }
-        const eRes = await query(`select event_type,message,created_at from hermes_task_events where task_id=$1 order by id desc limit 10`, [id]);
-        const events = eRes.rows.reverse().map((e,i)=>`${i+1}. ${e.event_type} — ${String(e.message||'').slice(0,120)}`).join("\n");
-        await sendTelegramMessage(chatId, `📌 Task #${t.id}\n\nStatus: ${t.status}\nIntent: ${t.intent || '-'}\nInput: ${String(t.input_text||'').slice(0,300)}\nApproval: ${t.approved_by ? `approved by ${t.approved_by}` : 'n/a'}\n\nLatest events:\n${events || '-' }\n\nResult: ${String(t.result_text || t.error_text || '-').replace(/(token|apikey|authorization|password|bearer)\s*[:=]?\s*[^\s]+/gi, "$1=[REDACTED]").slice(0,500)}`);
-        continue;
-      }
-      if (normalized.startsWith("/events ")) {
-        const parts = text.split(/\s+/);
-        const id = Number(parts[1]); if (!Number.isInteger(id) || id <= 0) { await sendTelegramMessage(chatId, "Dùng: /events <id> [limit 1-50] [offset>=0]"); continue; }
-        const limit = Math.min(50, Math.max(1, Number(parts[2] || 20)));
-        const offsetArg = Math.max(0, Number(parts[3] || 0));
-        let ev;
+      if (normalized === "/task" || normalized.startsWith("/task ")) {
         try {
-          ev = await query(`select id,event_type,message,created_at from hermes_task_events where task_id=$1 order by sequence_id asc nulls last, id asc, created_at asc limit $2 offset $3`, [id, limit, offsetArg]);
-        } catch {
-          ev = await query(`select id,event_type,message,created_at from hermes_task_events where task_id=$1 order by id asc, created_at asc limit $2 offset $3`, [id, limit, offsetArg]);
+          await sendTelegramMessage(chatId, await buildTelegramTaskMessage(text));
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /task: ${truncateForTelegram(err.message, 200)}`);
         }
-        const msg = ev.rows.map((e,i)=>`${i+1+offsetArg}. ${new Date(e.created_at).toISOString()} — ${e.event_type}\n   ${String(e.message||'').slice(0,120)}`).join("\n\n") || "Không có event.";
-        await sendTelegramMessage(chatId, `🧾 Events for task #${id}\n\n${msg}`);
+        console.log("COMMAND_HANDLED /task", { userId, chatId });
         continue;
       }
+
+      if (normalized === "/events" || normalized.startsWith("/events ")) {
+        try {
+          await sendTelegramMessage(chatId, await buildTelegramEventsMessage(text));
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /events: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /events", { userId, chatId });
+        continue;
+      }
+
+      if (normalized === "/memory stats") {
+        try {
+          await sendTelegramMessage(chatId, await buildMemoryStatsMessage());
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /memory stats: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /memory stats", { userId, chatId });
+        continue;
+      }
+
+      if (normalized === "/remember" || normalized.startsWith("/remember ")) {
+        try {
+          await sendTelegramMessage(chatId, await buildRememberMessage(text));
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /remember: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /remember", { userId, chatId });
+        continue;
+      }
+
+      if (normalized === "/recall" || normalized.startsWith("/recall ")) {
+        try {
+          await sendTelegramMessage(chatId, await buildRecallMessage(text));
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /recall: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /recall", { userId, chatId });
+        continue;
+      }
+
       if (normalized.startsWith("/approve")) {
         const id = Number(text.split(/\s+/)[1]);
         if (!Number.isInteger(id) || id <= 0) { await sendTelegramMessage(chatId, "Dùng: /approve <id_số_nguyên_dương>"); continue; }
@@ -1228,11 +1431,14 @@ Audit lỗi/sự cố và tạo hướng xử lý.
 /deploy-check <nội dung deploy>
 Checklist an toàn trước deploy.
 
-/learn <bài học>
-Lưu memory vào GBrain.
+/remember <thing Hermes should remember>
+Lưu memory an toàn, không tạo execution task.
 
-/recall <từ khóa>
-Tìm lại memory trong GBrain.
+/recall <keyword>
+Tìm lại memory an toàn.
+
+/memory stats
+Xem số lượng memory.
 
 Flow chuẩn:
 1. /codex <vấn đề>
