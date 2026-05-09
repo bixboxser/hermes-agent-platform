@@ -614,6 +614,68 @@ NEXT ACTION:
 - Review → /review <kết quả>`;
 }
 
+
+const CASUAL_TELEGRAM_INPUTS = new Set([
+  "hi",
+  "hello",
+  "hey",
+  "chào",
+  "chao",
+  "xin chào",
+  "xin chao",
+  "alo",
+  "test",
+  "ping",
+  "ok",
+]);
+
+const TASK_LIKE_TELEGRAM_PATTERNS = [
+  /^(git|gh|npm|pnpm|yarn|node|docker|kubectl)\b/i,
+  /^(kiểm tra|kiem tra|check|xem|chạy|chay|run)\b.*\b(health|status|test|build|deploy|log|logs)\b/i,
+  /^(tạo|tao|create|mở|mo|open)\b.*\b(issue|ticket|task|bug|pr|pull request)\b/i,
+  /\b(health check|repo status|branch status|run build|run test)\b/i,
+];
+
+function normalizeTelegramIntentText(text) {
+  return String(text || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[!?.。！？]+$/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function isCasualTelegramInput(text) {
+  return CASUAL_TELEGRAM_INPUTS.has(normalizeTelegramIntentText(text));
+}
+
+function isTaskLikeTelegramInput(text) {
+  const normalizedIntentText = normalizeTelegramIntentText(text);
+  return TASK_LIKE_TELEGRAM_PATTERNS.some((pattern) => pattern.test(normalizedIntentText));
+}
+
+function buildCasualTelegramReply() {
+  return [
+    "👋 Chào bạn! Hermes đang sẵn sàng hỗ trợ.",
+    "",
+    "Mình có thể giúp:",
+    "- Kiểm tra repo/health: git status, kiểm tra health",
+    "- Chạy build/test có duyệt an toàn: npm run build",
+    "- Tạo issue hoặc chuẩn bị prompt Codex: /code <task>, /codex <task>",
+    "- Audit/review/recall memory: /audit, /review, /recall",
+    "",
+    "Gõ /commands hoặc /menu để xem thêm lệnh.",
+  ].join("\n");
+}
+
+function buildUnknownTelegramReply(text) {
+  return [
+    `Mình chưa rõ bạn muốn Hermes làm gì với: "${String(text || "").slice(0, 120)}"`,
+    "",
+    "Bạn muốn mình kiểm tra, build/test, tạo issue, audit, hay chỉ chat?",
+    "Ví dụ: git status, npm run build, kiểm tra health, tạo issue <nội dung>.",
+  ].join("\n");
+}
+
 function isAllowed(userId) {
   return ALLOWED_USER_IDS.includes(Number(userId));
 }
@@ -1775,6 +1837,18 @@ NEXT ACTION:
 }
   
 
+
+      if (isCasualTelegramInput(text)) {
+        console.log("CASUAL_CHAT_HANDLED", { userId, chatId, text });
+        await sendTelegramMessage(chatId, buildCasualTelegramReply());
+        continue;
+      }
+
+      if (!isTaskLikeTelegramInput(text)) {
+        console.log("UNKNOWN_INTENT_CLARIFICATION", { userId, chatId, text });
+        await sendTelegramMessage(chatId, buildUnknownTelegramReply(text));
+        continue;
+      }
 
       console.log("DEFAULT_TASK_PATH_ENTERED", { userId, chatId, text });
       const taskId = await createTask(chatId, userId, text);
