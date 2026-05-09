@@ -1,3 +1,4 @@
+const nodeCrypto = require('node:crypto');
 const express = require("express");
 const axios = require("axios");
 const { query } = require("./db");
@@ -620,7 +621,7 @@ function isAllowed(userId) {
 
 async function createTask(chatId, userId, text) {
   const normalized = normalizeInputText(text);
-  const dedupeKey = crypto
+  const dedupeKey = nodeCrypto
     .createHash("sha256")
     .update(`${userId}:${normalized}`)
     .digest("hex");
