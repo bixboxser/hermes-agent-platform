@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+const nodeCrypto = require('node:crypto');
 
 function normalizeInputText(inputText) {
   return String(inputText || '')
@@ -40,7 +40,7 @@ function canonicalizeApprovalSnapshot({ taskId, payload, inputText, intent, appE
 }
 
 function hashApprovalSnapshot(canonicalPayload) {
-  return crypto
+  return nodeCrypto
     .createHash('sha256')
     .update(JSON.stringify(sortKeysDeep(canonicalPayload)))
     .digest('hex');

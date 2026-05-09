@@ -218,6 +218,77 @@ async function recallStructuredMemories(memoryType) {
     return true;
   });
 }
+
+async function rememberOperatorMemory(text, source = "telegram_operator") {
+  const memoryText = String(text || "").trim();
+  if (!memoryText) {
+    throw new Error("Memory text is required");
+  }
+
+  const lower = memoryText.toLowerCase();
+  let memoryType = "project_context";
+  if (lower.includes("deploy") || lower.includes("docker") || lower.includes("env")) {
+    memoryType = "deployment_rule";
+  } else if (lower.includes("approval") || lower.includes("command") || lower.includes("operator")) {
+    memoryType = "ops_sop";
+  } else if (lower.includes("bug") || lower.includes("error") || lower.includes("fail")) {
+    memoryType = "known_bug";
+  } else if (lower.includes("code") || lower.includes("test") || lower.includes("lint")) {
+    memoryType = "coding_rule";
+  }
+
+  const memoryKey = memoryText.split(/\s+/).slice(0, 8).join(" ").toLowerCase();
+  const result = await query(
+    `insert into hermes_memories (memory_key, memory_text, source, memory_type, importance, confidence)
+     values ($1, $2, $3, $4, 3, 0.8)
+     returning id, memory_key, memory_text, memory_type, created_at`,
+    [memoryKey, memoryText, source, memoryType],
+  );
+
+  return result.rows[0];
+}
+
+async function recallOperatorMemories(searchText, limit = 5) {
+  const keyword = String(searchText || "").trim();
+  if (!keyword) return [];
+  const terms = keyword.split(/\s+/).filter(Boolean).slice(0, 5);
+  const pattern = `%${terms.join("%")}%`;
+  const result = await query(
+    `select id, memory_key, memory_text, source, memory_type, importance, confidence, created_at, updated_at
+     from hermes_memories
+     where memory_text ilike $1
+        or memory_key ilike $1
+        or memory_type ilike $1
+     order by coalesce(last_used_at, updated_at, created_at) desc, id desc
+     limit $2`,
+    [pattern, Math.max(1, Math.min(Number(limit) || 5, 10))],
+  );
+
+  if (result.rows.length) {
+    await query(`update hermes_memories set last_used_at=now() where id = any($1::bigint[])`, [result.rows.map((r) => r.id)]);
+  }
+
+  return result.rows;
+}
+
+async function getOperatorMemoryStats() {
+  const byType = await query(
+    `select coalesce(memory_type, 'uncategorized') as memory_type, count(*)::int as count
+     from hermes_memories
+     group by coalesce(memory_type, 'uncategorized')
+     order by count desc, memory_type asc`,
+  );
+  const total = await query(
+    `select count(*)::int as total, max(coalesce(updated_at, created_at)) as latest_memory_at
+     from hermes_memories`,
+  );
+  return {
+    total: total.rows[0]?.total || 0,
+    latest_memory_at: total.rows[0]?.latest_memory_at || null,
+    by_type: byType.rows || [],
+  };
+}
+
 async function runHermesDispatcher(input) {
 
   const lowerInput = String(input || "").toLowerCase();
@@ -902,6 +973,9 @@ NEXT ACTION:
 
 
 module.exports = {
+  rememberOperatorMemory,
+  recallOperatorMemories,
+  getOperatorMemoryStats,
   recallStructuredMemories,
   ensureGBrainSchema,
   learnFromText,
