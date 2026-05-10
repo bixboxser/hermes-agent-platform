@@ -12,8 +12,14 @@ test('worker.js resolves external CLI and skill registry import conflict', () =>
   for (const marker of conflictMarkers) {
     assert.equal(worker.includes(marker), false);
   }
-  assert.match(
-    worker,
-    /const \{ runGoalTask \} = require\("\.\/dispatcher\/goals"\);\nconst \{ handleExternalCliTask, approvedExternalActionsFromSnapshot \} = require\("\.\/dispatcher\/externalCliTools"\);\nconst \{ buildSkillContext, matchSkills, checkSkillRequirements \} = require\("\.\/skills\/registry"\);/,
-  );
+  const expectedResolvedBlock = [
+    'const { runGoalTask } = require("./dispatcher/goals");',
+    'const { handleExternalCliTask, approvedExternalActionsFromSnapshot } = require("./dispatcher/externalCliTools");',
+    'const { buildSkillContext, matchSkills, checkSkillRequirements } = require("./skills/registry");',
+    '',
+    'const rawExecAsync = promisify(exec);',
+  ].join('\n');
+
+  assert.equal(worker.includes(expectedResolvedBlock), true);
+  assert.equal((worker.match(/handleExternalCliTask/g) || []).length, 2);
 });
