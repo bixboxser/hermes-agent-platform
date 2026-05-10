@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const {
   CUSTOM_SKILL_NAMES,
+  buildSkillContext,
   classifyTelegramSkillIntent,
   formatSkillMatches,
   getSkillRegistry,
@@ -54,6 +55,13 @@ assert.deepEqual(
   matchSkills("create PR for booking timezone bug").map((skill) => skill.name),
   ["github-pr-workflow", "somewhere-booking-debug"],
 );
+
+const skillContext = buildSkillContext("create PR for booking timezone bug", { env: {} });
+assert.deepEqual(
+  skillContext.skills.map((skill) => skill.name),
+  ["github-pr-workflow", "somewhere-booking-debug"],
+);
+assert.equal(skillContext.skills[0].requirements.ok, false);
 
 assert.deepEqual(
   matchSkills("make daily cashier report Google Sheet").map((skill) => skill.name),

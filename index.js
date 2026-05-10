@@ -28,7 +28,7 @@ const {
   buildAudit,
   buildDeployCheck,
 } = require("./gbrain");
-const { isExternalCliTask, routeTool } = require('./dispatcher/externalCliTools');
+const { isExternalCliTask, routeTool, buildExternalCliApprovalPlan } = require('./dispatcher/externalCliTools');
 const app = express();
 app.use(express.json());
 
@@ -1044,27 +1044,46 @@ async function createTask(chatId, userId, text, options = {}) {
     .createHash("sha256")
     .update(`${userId}:${normalized}${dedupeSalt}`)
     .digest("hex");
+  const externalCliApproval = buildExternalCliApprovalPlan(text);
+  if (externalCliApproval && !externalCliApproval.ok) {
+    const unsafeText = externalCliApproval.unsafe_commands.length
+      ? ` Unsafe command(s): ${externalCliApproval.unsafe_commands.join(", ")}`
+      : "";
+    throw new Error(`external_cli_command_rejected: ${externalCliApproval.error}.${unsafeText}`);
+  }
+  const approvalIntent = externalCliApproval?.ok ? "external_cli" : "execute";
   const approvalSnapshot = canonicalizeApprovalSnapshot({
     taskId: "",
-    payload: {
-      intent: "execute",
-      normalized_input: normalized,
-      execution_plan: ["parse_intent", "run_gates", "execute_plan"],
-      risk_level: "medium",
-      action_list: ["git status", "npm test", "npm run build"],
-      memory_ids_used: [],
-    },
+    payload: externalCliApproval?.ok
+      ? {
+          intent: "external_cli",
+          normalized_input: normalized,
+          tool: externalCliApproval.tool,
+          tool_label: externalCliApproval.tool_label,
+          execution_plan: externalCliApproval.plan,
+          risk_level: "medium",
+          action_list: externalCliApproval.commands,
+          memory_ids_used: [],
+        }
+      : {
+          intent: "execute",
+          normalized_input: normalized,
+          execution_plan: ["parse_intent", "run_gates", "execute_plan"],
+          risk_level: "medium",
+          action_list: ["git status", "npm test", "npm run build"],
+          memory_ids_used: [],
+        },
     inputText: text,
-    intent: "execute",
+    intent: approvalIntent,
     appEnv: process.env.APP_ENV || "development",
   });
 
   const result = await query(
-    `insert into hermes_tasks (telegram_chat_id, telegram_user_id, input_text, status, idempotency_key)
-     values ($1, $2, $3, 'planned', $4)
+    `insert into hermes_tasks (telegram_chat_id, telegram_user_id, input_text, intent, status, idempotency_key)
+     values ($1, $2, $3, $4, 'planned', $5)
      on conflict (idempotency_key) do update set updated_at=now()
      returning id`,
-    [chatId, userId, text, dedupeKey]
+    [chatId, userId, text, approvalIntent, dedupeKey]
   );
 
   const taskId = result.rows[0].id;
@@ -1072,7 +1091,7 @@ async function createTask(chatId, userId, text, options = {}) {
     taskId,
     payload: approvalSnapshot,
     inputText: text,
-    intent: "execute",
+    intent: approvalIntent,
     appEnv: process.env.APP_ENV || "development",
   });
   const approvalSnapshotHash = hashApprovalSnapshot(canonicalApprovalSnapshot);
@@ -1104,7 +1123,8 @@ async function createTask(chatId, userId, text, options = {}) {
      values ($1, 'pending_approval', $2)`,
     [taskId, "Task requires explicit approval before running"]
     );
-    const actionList = Array.isArray(approvalSnapshot.action_list) ? approvalSnapshot.action_list.join(", ") : "-";
+    const actionItems = Array.isArray(approvalSnapshot.action_list) ? approvalSnapshot.action_list : [];
+    const actionList = actionItems.length ? `\n- ${actionItems.join("\n- ")}` : " -";
     const shortHash = approvalSnapshotHash ? approvalSnapshotHash.slice(0, 12) : "-";
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
     const approvalMessage = [
@@ -1114,7 +1134,7 @@ async function createTask(chatId, userId, text, options = {}) {
       `Risk: ${approvalSnapshot.risk_level || "-"}`,
       `Expires: ${expiresAt}`,
       `Snapshot: ${shortHash}`,
-      `Actions: ${actionList || "-"}`,
+      `Actions:${actionList || " -"}`,
     ].join("\n");
     try {
       await sendTelegramMessage(chatId, approvalMessage, {
@@ -2441,8 +2461,16 @@ NEXT ACTION:
       }
 
       console.log("DEFAULT_TASK_PATH_ENTERED", { userId, chatId, text });
-      const taskId = await createTask(chatId, userId, text);
-      await sendTelegramMessage(chatId, `Đã nhận task #${taskId}. Hermes đang xử lý...`);
+      try {
+        const taskId = await createTask(chatId, userId, text);
+        await sendTelegramMessage(chatId, `Đã nhận task #${taskId}. Hermes đang xử lý...`);
+      } catch (err) {
+        if (String(err.message || "").startsWith("external_cli_command_rejected:")) {
+          await sendTelegramMessage(chatId, `Rejected external CLI request: ${String(err.message).replace(/^external_cli_command_rejected:\s*/, "")}`);
+          continue;
+        }
+        throw err;
+      }
     }
   } catch (err) {
     console.error("Polling error:", err.response?.data || err.message);
