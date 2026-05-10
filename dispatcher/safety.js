@@ -1,3 +1,11 @@
+
+const EXTERNAL_CLI_TOOLS = '(company-goat|contact-goat|flight-goat|archive-is|apartments|hackernews|espn|printing-press)';
+const EXTERNAL_CLI_SAFE_PATTERNS = [
+  new RegExp(`^command -v ${EXTERNAL_CLI_TOOLS}$`),
+  new RegExp(`^${EXTERNAL_CLI_TOOLS} --help( \\| head -([1-7]?[0-9]|80))?$`),
+  new RegExp(`^${EXTERNAL_CLI_TOOLS} --agent( \\| head -([1-7]?[0-9]|80))?$`),
+];
+
 const SAFE_PATTERNS = [
   /^ls(\s|$)/,
   /^cat(\s|$)/,
@@ -27,6 +35,7 @@ function classifyCommand(command) {
   if (DANGEROUS_PATTERNS.some((p) => p.test(cmd))) return { allowed: true, riskLevel: 'dangerous' };
   if (RISKY_PATTERNS.some((p) => p.test(cmd))) return { allowed: true, riskLevel: 'risky' };
   if (SAFE_PATTERNS.some((p) => p.test(cmd))) return { allowed: true, riskLevel: 'safe' };
+  if (EXTERNAL_CLI_SAFE_PATTERNS.some((p) => p.test(cmd))) return { allowed: true, riskLevel: 'safe' };
   return { allowed: false, riskLevel: 'unknown', reason: 'unknown command' };
 }
 
