@@ -709,6 +709,42 @@ function parsePositiveIntegerArg(text, command) {
   return { id };
 }
 
+function parseCommandIdAndReason(text, command) {
+  const match = String(text || "").trim().match(/^\/[a-z_-]+(?:@[\w_]+)?\s+(\d+)(?:\s+([\s\S]+))?$/i);
+  const id = Number(match?.[1]);
+  if (!Number.isInteger(id) || id <= 0) {
+    return { error: `Dùng: ${command} <id_số_nguyên_dương>${command === "/retry" ? "" : " <reason optional>"}` };
+  }
+  return { id, reason: truncateForTelegram(match?.[2] || "", 240) };
+}
+
+function formatIso(value) {
+  return value ? new Date(value).toISOString() : "-";
+}
+
+function formatTimeRemaining(value) {
+  if (!value) return "-";
+  const seconds = Math.floor((new Date(value).getTime() - Date.now()) / 1000);
+  if (seconds <= 0) return "expired";
+  return formatAge(seconds);
+}
+
+function approvalPayloadSummary(payload) {
+  const p = payload || {};
+  const risk = p.risk_level || p.riskLevel || "-";
+  const actions = Array.isArray(p.action_list)
+    ? p.action_list
+    : Array.isArray(p.actions)
+      ? p.actions
+      : Array.isArray(p.execution_plan)
+        ? p.execution_plan
+        : [];
+  return {
+    risk,
+    actions: actions.map((a) => truncateForTelegram(typeof a === "string" ? a : JSON.stringify(a), 60)).slice(0, 4).join(", ") || "-",
+  };
+}
+
 async function buildTelegramStatusMessage() {
   const health = await getSystemHealth();
   const latest = health.latest_task;
@@ -738,6 +774,65 @@ async function buildTelegramStatusMessage() {
     `- Oldest approval: ${formatAge(health.queue.oldest_pending_approval_seconds)}`,
     `- Latest task: ${latestLine}`,
     ...warnings,
+  ].join("\n");
+}
+
+async function buildPendingApprovalsMessage() {
+  const res = await query(
+    `select id,status,input_text,intent,created_at,approval_expires_at,approval_snapshot_payload
+     from hermes_tasks
+     where status=$1
+     order by created_at asc
+     limit $2`,
+    ["pending_approval", 12],
+  );
+  if (!res.rows.length) return "No pending approvals.";
+
+  const rows = res.rows.map((t) => {
+    const payload = approvalPayloadSummary(t.approval_snapshot_payload || {});
+    const ageSeconds = Math.floor((Date.now() - new Date(t.created_at).getTime()) / 1000);
+    return [
+      `#${t.id} ${t.status} — ${truncateForTelegram(t.input_text, 90)}`,
+      `Risk: ${payload.risk} | Age: ${formatAge(ageSeconds)} | Expires: ${formatIso(t.approval_expires_at)} (${formatTimeRemaining(t.approval_expires_at)})`,
+      `Actions: ${payload.actions}`,
+    ].join("\n");
+  });
+
+  return ["Pending approvals:", ...rows].join("\n\n");
+}
+
+async function buildQueueMessage() {
+  let health;
+  const warnings = [];
+  try {
+    health = await getSystemHealth();
+  } catch (err) {
+    health = { queue: {}, worker: {}, latest_task: null, warnings: [] };
+    warnings.push(`health partial: ${truncateForTelegram(err.message, 120)}`);
+  }
+  const queue = health.queue || {};
+  const latest = health.latest_task
+    ? `#${health.latest_task.id} ${health.latest_task.status} — ${truncateForTelegram(health.latest_task.input_text, 80)}`
+    : "-";
+  const workerAge = health.worker?.last_heartbeat_at
+    ? formatAge(Math.floor((Date.now() - new Date(health.worker.last_heartbeat_at).getTime()) / 1000))
+    : "-";
+  const healthWarnings = [...warnings, ...(health.warnings || [])].slice(0, 3);
+
+  return [
+    "Queue summary",
+    `- pending: ${queue.pending || 0}`,
+    `- planned: ${queue.planned || 0}`,
+    `- pending_approval: ${queue.pending_approval || 0}`,
+    `- approved: ${queue.approved || 0}`,
+    `- running: ${queue.running || 0}`,
+    `- completed 24h: ${queue.completed_24h || 0}`,
+    `- failed 24h: ${queue.failed_24h || 0}`,
+    `- oldest pending: ${formatAge(queue.oldest_pending_seconds)}`,
+    `- oldest approval: ${formatAge(queue.oldest_pending_approval_seconds)}`,
+    `- latest: ${latest}`,
+    `- worker: ${health.worker?.alive ? "alive" : "unknown"}${workerAge !== "-" ? ` (${workerAge} ago)` : ""}`,
+    ...healthWarnings.map((w) => `- warning: ${truncateForTelegram(w, 140)}`),
   ].join("\n");
 }
 
@@ -846,11 +941,12 @@ function isAllowed(userId) {
 }
 
 
-async function createTask(chatId, userId, text) {
+async function createTask(chatId, userId, text, options = {}) {
   const normalized = normalizeInputText(text);
+  const dedupeSalt = options.idempotencySalt ? `:${options.idempotencySalt}` : "";
   const dedupeKey = nodeCrypto
     .createHash("sha256")
-    .update(`${userId}:${normalized}`)
+    .update(`${userId}:${normalized}${dedupeSalt}`)
     .digest("hex");
   const approvalSnapshot = canonicalizeApprovalSnapshot({
     taskId: "",
@@ -963,7 +1059,7 @@ async function shouldRateLimitApproval(taskId, userId, actionType) {
   return (r.rows[0]?.c || 0) > 0;
 }
 
-async function handleApprovalDecision({ taskId, actorUserId, chatId, action }) {
+async function handleApprovalDecision({ taskId, actorUserId, chatId, action, reason = "" }) {
   if (!Number.isInteger(taskId) || taskId <= 0) {
     await sendTelegramMessage(chatId, "Dùng: /approve <id_số_nguyên_dương> hoặc /reject <id_số_nguyên_dương>");
     return;
@@ -973,7 +1069,7 @@ async function handleApprovalDecision({ taskId, actorUserId, chatId, action }) {
     return;
   }
   const taskCheck = await query(
-    `select status, input_text, intent, approval_snapshot_hash, approval_snapshot_payload, approval_expires_at
+    `select id,status, input_text, intent, approval_snapshot_hash, approval_snapshot_payload, approval_expires_at
      from hermes_tasks where id=$1 limit 1`,
     [taskId],
   );
@@ -1003,14 +1099,125 @@ async function handleApprovalDecision({ taskId, actorUserId, chatId, action }) {
     const approved = await query(`update hermes_tasks set status='approved', approved_by=$2, approved_at=now(), updated_at=now() where id=$1 and status='pending_approval'`, [taskId, String(actorUserId)]);
     if ((approved.rowCount || 0) !== 1) { await sendTelegramMessage(chatId, `⚠️ Task ${taskId} không ở trạng thái chờ duyệt.`); return; }
     await query(`insert into hermes_task_events (task_id, event_type, message) values ($1, 'approved', $2)`, [taskId, "Task approved from Telegram"]);
-    await sendTelegramMessage(chatId, `✅ Đã duyệt task ${taskId}`);
+    await sendTelegramMessage(chatId, [`✅ Approved task #${taskId}`, `Input: ${truncateForTelegram(t.input_text, 140)}`, "Next: worker will pick it up."].join("\n"));
     return;
   }
-  const rej = await query(`update hermes_tasks set status='failed', error_text='Rejected by operator', updated_at=now() where id=$1 and status='pending_approval'`, [taskId]);
+  const safeReason = truncateForTelegram(reason || "No reason provided", 240);
+  const errorText = `Rejected by telegram_operator: ${safeReason}`;
+  const rej = await query(`update hermes_tasks set status='failed', error_text=$2, updated_at=now() where id=$1 and status='pending_approval'`, [taskId, errorText]);
   if ((rej.rowCount || 0) === 1) {
-    await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'rejected',$2,$3)`, [taskId, 'Task rejected from Telegram', { callback_user_id: actorUserId }]);
+    await query(`insert into hermes_task_events (task_id, event_type, message, payload) values ($1,'rejected',$2,$3)`, [taskId, 'Task rejected from Telegram', { callback_user_id: actorUserId, reason: safeReason }]);
   }
-  await sendTelegramMessage(chatId, `❌ Đã từ chối task ${taskId}`);
+  await sendTelegramMessage(chatId, [`❌ Rejected task #${taskId}`, `Reason: ${safeReason}`, "Final status: failed"].join("\n"));
+}
+
+async function handleCancelTask({ taskId, actorUserId, chatId, reason = "" }) {
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    await sendTelegramMessage(chatId, "Dùng: /cancel <id_số_nguyên_dương> <reason optional>");
+    return;
+  }
+  if (!isAllowed(actorUserId)) {
+    await sendTelegramMessage(chatId, `❌ Bạn không có quyền cancel task ${taskId}`);
+    return;
+  }
+  const res = await query(
+    `select id,status,input_text from hermes_tasks where id=$1 limit 1`,
+    [taskId],
+  );
+  const task = res.rows[0];
+  if (!task) {
+    await sendTelegramMessage(chatId, `⚠️ Task ${taskId} không tồn tại.`);
+    return;
+  }
+  if (task.status === "running") {
+    await sendTelegramMessage(chatId, "Running task cancellation is not supported safely yet.");
+    return;
+  }
+  if (["completed", "failed"].includes(task.status)) {
+    await sendTelegramMessage(chatId, `Task #${taskId} is terminal (${task.status}) and cannot be cancelled.`);
+    return;
+  }
+  if (task.status !== "pending_approval") {
+    await sendTelegramMessage(chatId, `Task #${taskId} is ${task.status}; current FSM only supports safe cancel from pending_approval -> failed.`);
+    return;
+  }
+
+  const safeReason = truncateForTelegram(reason || "No reason provided", 240);
+  const errorText = `Cancelled by telegram_operator: ${safeReason}`;
+  const upd = await query(
+    `update hermes_tasks
+     set status='failed', error_text=$2, updated_at=now()
+     where id=$1 and status='pending_approval'`,
+    [taskId, errorText],
+  );
+  if ((upd.rowCount || 0) !== 1) {
+    await sendTelegramMessage(chatId, `⚠️ Task #${taskId} is no longer pending_approval.`);
+    return;
+  }
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message, payload)
+     values ($1,'cancelled',$2,$3)`,
+    [taskId, 'Task cancelled from Telegram', { actor_user_id: actorUserId, reason: safeReason, final_status: 'failed' }],
+  );
+  await sendTelegramMessage(chatId, [`🛑 Cancelled task #${taskId}`, `Reason: ${safeReason}`, "Final status: failed"].join("\n"));
+}
+
+async function handleRetryTask({ taskId, actorUserId, chatId }) {
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    await sendTelegramMessage(chatId, "Dùng: /retry <id_số_nguyên_dương>");
+    return;
+  }
+  if (!isAllowed(actorUserId)) {
+    await sendTelegramMessage(chatId, `❌ Bạn không có quyền retry task ${taskId}`);
+    return;
+  }
+  const res = await query(
+    `select id,status,input_text,telegram_chat_id,telegram_user_id,intent
+     from hermes_tasks
+     where id=$1
+     limit 1`,
+    [taskId],
+  );
+  const original = res.rows[0];
+  if (!original) {
+    await sendTelegramMessage(chatId, `⚠️ Task ${taskId} không tồn tại.`);
+    return;
+  }
+  if (original.status !== "failed") {
+    await sendTelegramMessage(chatId, `Task #${taskId} is ${original.status}; only failed tasks can be retried.`);
+    return;
+  }
+
+  const existingRetry = await query(
+    `select (payload->>'new_task_id')::bigint as new_task_id
+     from hermes_task_events
+     where task_id=$1 and event_type='retry_created' and payload ? 'new_task_id'
+     order by created_at desc, id desc
+     limit 1`,
+    [taskId],
+  );
+  const existingId = existingRetry.rows[0]?.new_task_id;
+  if (existingId) {
+    const existingTask = await query(`select id,status,input_text from hermes_tasks where id=$1 limit 1`, [existingId]);
+    if (existingTask.rows[0]) {
+      await sendTelegramMessage(chatId, [`Retry already exists for task #${taskId}: #${existingId}`, `Status: ${existingTask.rows[0].status}`, `Input: ${truncateForTelegram(existingTask.rows[0].input_text, 140)}`].join("\n"));
+      return;
+    }
+  }
+
+  const newTaskId = await createTask(original.telegram_chat_id || chatId, original.telegram_user_id || actorUserId, original.input_text, { idempotencySalt: `retry:${taskId}` });
+  const newTask = await query(`select id,status,input_text from hermes_tasks where id=$1 limit 1`, [newTaskId]);
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message, payload)
+     values ($1,'retry_created',$2,$3)`,
+    [taskId, 'Retry task created from Telegram', { actor_user_id: actorUserId, new_task_id: newTaskId }],
+  );
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message, payload)
+     values ($1,'retry_of',$2,$3)`,
+    [newTaskId, 'Task created as retry from Telegram', { actor_user_id: actorUserId, original_task_id: taskId }],
+  );
+  await sendTelegramMessage(chatId, [`🔁 Retried task #${taskId} as #${newTaskId}`, `New status: ${newTask.rows[0]?.status || "unknown"}`, `Input: ${truncateForTelegram(original.input_text, 140)}`].join("\n"));
 }
 
 async function createCodeAgentTask(chatId, userId, taskText) {
@@ -1197,6 +1404,24 @@ if (callback) {
   continue;
 }
 
+  if (data === "menu_queue") {
+    try {
+      await sendTelegramMessage(chatId, await buildQueueMessage());
+    } catch (err) {
+      await sendTelegramMessage(chatId, `Lỗi /queue: ${truncateForTelegram(err.message, 200)}`);
+    }
+    continue;
+  }
+
+  if (data === "menu_pending") {
+    try {
+      await sendTelegramMessage(chatId, await buildPendingApprovalsMessage());
+    } catch (err) {
+      await sendTelegramMessage(chatId, `Lỗi /pending: ${truncateForTelegram(err.message, 200)}`);
+    }
+    continue;
+  }
+
   if (data === "menu_deploy_check") {
   await sendTelegramMessage(chatId, "🚀 Nhập nội dung cần deploy-check:");
   console.log("FSM_TRANSITION", { userId: callback.from.id, state: TELEGRAM_STATES.AWAITING_DEPLOY_CHECK });
@@ -1367,6 +1592,26 @@ if (callback) {
         continue;
       }
 
+      if (normalized === "/pending") {
+        try {
+          await sendTelegramMessage(chatId, await buildPendingApprovalsMessage());
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /pending: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /pending", { userId, chatId });
+        continue;
+      }
+
+      if (normalized === "/queue") {
+        try {
+          await sendTelegramMessage(chatId, await buildQueueMessage());
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /queue: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /queue", { userId, chatId });
+        continue;
+      }
+
       if (normalized === "/memory stats") {
         try {
           await sendTelegramMessage(chatId, await buildMemoryStatsMessage());
@@ -1397,54 +1642,75 @@ if (callback) {
         continue;
       }
 
-      if (normalized.startsWith("/approve")) {
-        const id = Number(text.split(/\s+/)[1]);
-        if (!Number.isInteger(id) || id <= 0) { await sendTelegramMessage(chatId, "Dùng: /approve <id_số_nguyên_dương>"); continue; }
-        await handleApprovalDecision({ taskId: id, actorUserId: userId, chatId, action: "approve" });
+      if (normalized === "/approve" || normalized.startsWith("/approve ")) {
+        const parsed = parseCommandIdAndReason(text, "/approve");
+        if (parsed.error) { await sendTelegramMessage(chatId, "Dùng: /approve <id_số_nguyên_dương>"); continue; }
+        try {
+          await handleApprovalDecision({ taskId: parsed.id, actorUserId: userId, chatId, action: "approve" });
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /approve: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /approve", { userId, chatId, taskId: parsed.id });
         continue;
       }
-      if (normalized.startsWith("/reject")) {
-        const id = Number(text.split(/\s+/)[1]);
-        if (!Number.isInteger(id) || id <= 0) { await sendTelegramMessage(chatId, "Dùng: /reject <id_số_nguyên_dương>"); continue; }
-        await handleApprovalDecision({ taskId: id, actorUserId: userId, chatId, action: "reject" });
+      if (normalized === "/reject" || normalized.startsWith("/reject ")) {
+        const parsed = parseCommandIdAndReason(text, "/reject");
+        if (parsed.error) { await sendTelegramMessage(chatId, parsed.error); continue; }
+        try {
+          await handleApprovalDecision({ taskId: parsed.id, actorUserId: userId, chatId, action: "reject", reason: parsed.reason });
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /reject: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /reject", { userId, chatId, taskId: parsed.id });
+        continue;
+      }
+
+      if (normalized === "/cancel" || normalized.startsWith("/cancel ")) {
+        const parsed = parseCommandIdAndReason(text, "/cancel");
+        if (parsed.error) { await sendTelegramMessage(chatId, parsed.error); continue; }
+        try {
+          await handleCancelTask({ taskId: parsed.id, actorUserId: userId, chatId, reason: parsed.reason });
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /cancel: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /cancel", { userId, chatId, taskId: parsed.id });
+        continue;
+      }
+
+      if (normalized === "/retry" || normalized.startsWith("/retry ")) {
+        const parsed = parseCommandIdAndReason(text, "/retry");
+        if (parsed.error) { await sendTelegramMessage(chatId, parsed.error); continue; }
+        try {
+          await handleRetryTask({ taskId: parsed.id, actorUserId: userId, chatId });
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /retry: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /retry", { userId, chatId, taskId: parsed.id });
         continue;
       }
 
       if (text === "/commands") {
   await sendTelegramMessage(chatId, `📚 Hermes Commands
 
-/menu
-Mở bảng nút nhanh.
+/status — system health
+/queue — queue summary
+/pending — pending approvals
+/task <id> — task details
+/events <id> — task event timeline
+/approve <id> — approve pending task
+/reject <id> <reason> — reject pending task
+/cancel <id> <reason> — cancel queued approval safely
+/retry <id> — retry failed task
+/remember <text> — save memory
+/recall <keyword> — search memory
+/memory stats — memory stats
 
-/status
-Kiểm tra trạng thái Hermes, GBrain, session, logs.
-
-/codex <task>
-Tạo prompt chuẩn cho Codex/Cursor.
-
-/review <kết quả Codex>
-Review patch, đánh giá rủi ro, auto learn vào GBrain.
-
-/audit <vấn đề>
-Audit lỗi/sự cố và tạo hướng xử lý.
-
-/deploy-check <nội dung deploy>
-Checklist an toàn trước deploy.
-
-/remember <thing Hermes should remember>
-Lưu memory an toàn, không tạo execution task.
-
-/recall <keyword>
-Tìm lại memory an toàn.
-
-/memory stats
-Xem số lượng memory.
-
-Flow chuẩn:
-1. /codex <vấn đề>
-2. Copy sang Codex
-3. /review <kết quả>
-4. /recall <từ khóa> để kiểm tra Hermes đã học`);
+Other tools:
+/menu — quick buttons
+/codex <task> — build Codex prompt
+/review <result> — review patch and learn
+/audit <issue> — deep debug/audit
+/deploy-check <text> — deploy safety checklist`);
   continue;
 }
 
@@ -1556,6 +1822,7 @@ NEXT ACTION:
       inline_keyboard: [
         [{ text: "📚 Commands", callback_data: "menu_commands" }],
         [{ text: "📊 Status", callback_data: "menu_status" }],
+        [{ text: "📋 Queue", callback_data: "menu_queue" }, { text: "🛂 Pending", callback_data: "menu_pending" }],
         [{ text: "🚀 Deploy Check", callback_data: "menu_deploy_check" }],
         [{ text: "🧪 Audit", callback_data: "menu_audit" }],
         [{ text: "🛠 Build Codex Prompt", callback_data: "menu_codex" }],
