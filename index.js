@@ -4,7 +4,17 @@ const axios = require("axios");
 const { query } = require("./db");
 const { canonicalizeApprovalSnapshot, hashApprovalSnapshot, normalizeInputText } = require("./approvalSnapshot");
 const { getSystemHealth } = require("./dispatcher/health");
-const { formatSkillsList, formatSkillMatches, classifyTelegramSkillIntent } = require("./skills/registry");
+const {
+  formatSkillsList,
+  formatSkillMatches,
+  formatSkillShow,
+  formatSkillWhy,
+  formatSkillDoctor,
+  classifyTelegramSkillIntent,
+  matchSkills,
+  checkSkillRequirements,
+  buildSkillContext,
+} = require("./skills/registry");
 const {
   ensureGBrainSchema,
   learnFromText,
@@ -683,16 +693,31 @@ function buildUnknownTelegramReply(text) {
 
 
 
-function buildSkillsCommandReply(text) {
+async function buildSkillsCommandReply(text) {
   const input = String(text || "").trim();
   if (/^\/skills(?:@\w+)?\s+list$/i.test(input) || /^\/skills(?:@\w+)?$/i.test(input)) {
-    return `Curated Hermes Skill Pack v1\n\n${formatSkillsList()}\n\nRouting: classify intent → match top 1-3 skills → check env/tools → load selected SKILL.md only → plan → require approval for risky/prod actions → execute → verify → save lessons.`;
+    return `Curated Hermes Skill Pack v2\n\n${formatSkillsList()}\n\nRouting: classify intent → match top 1-3 skills → check env/tools → load selected SKILL.md only → plan → require approval for risky/prod actions → execute → verify → save lessons.`;
   }
 
-  const match = input.match(/^\/skills(?:@\w+)?\s+match\s+([\s\S]+)$/i);
-  if (!match) {
-    return "Dùng: /skills list hoặc /skills match <task>";
+  const showMatch = input.match(/^\/skills(?:@\w+)?\s+show\s+([\s\S]+)$/i);
+  if (showMatch) return formatSkillShow(showMatch[1].trim());
+
+  const whyMatch = input.match(/^\/skills(?:@\w+)?\s+why\s+([\s\S]+)$/i);
+  if (whyMatch) {
+    const queryText = whyMatch[1].trim();
+    if (!queryText) return "Dùng: /skills why <task>";
+    const routed = classifyTelegramSkillIntent(queryText);
+    if (routed.intent === "small_talk") return "Small-talk detected: no heavy task flow and no SKILL.md loaded.";
+    return formatSkillWhy(queryText, { limit: 3 });
   }
+
+  if (/^\/skills(?:@\w+)?\s+doctor$/i.test(input)) return formatSkillDoctor();
+
+  const learnMatch = input.match(/^\/skills(?:@\w+)?\s+learn(?:\s+([\s\S]+))?$/i);
+  if (learnMatch) return "Skill learning is not implemented yet in Skill Layer v2. Use /task <id> to inspect lesson candidates.";
+
+  const match = input.match(/^\/skills(?:@\w+)?\s+match\s+([\s\S]+)$/i);
+  if (!match) return "Dùng: /skills list | show <name> | why <task> | match <task> | doctor | learn <task_id>";
 
   const queryText = match[1].trim();
   if (!queryText) return "Dùng: /skills match <task>";
@@ -964,6 +989,54 @@ function isAllowed(userId) {
 }
 
 
+async function logSkillUsageForTask(taskId, text) {
+  const routed = classifyTelegramSkillIntent(text);
+  if (routed.intent === "small_talk") return;
+  const selected = matchSkills(text, 3);
+  if (!selected.length) return;
+  const selectedSkills = selected.map((skill) => ({ name: skill.name, score: skill.score }));
+  const requirementDetails = selected.map((skill) => {
+    const req = checkSkillRequirements(skill, process.env);
+    return {
+      name: skill.name,
+      missingEnv: req.missingEnv,
+      missingTools: req.missingTools,
+      hostOperatorTools: req.hostOperatorTools,
+      toolStatuses: (req.toolStatuses || []).map((tool) => ({ tool: tool.tool, kind: tool.kind, status: tool.status, availableInContainer: tool.availableInContainer })),
+      ok: req.ok,
+    };
+  });
+  const missingEnv = [...new Set(requirementDetails.flatMap((item) => item.missingEnv || []))];
+  const missingTools = [...new Set(requirementDetails.flatMap((item) => item.missingTools || []))];
+  const context = buildSkillContext(text, { limit: 3 });
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skills_matched', $2, $3)`,
+    [taskId, 'Skills matched for task planning', { selected_skills: selectedSkills }]
+  );
+  await query(
+    `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skill_requirements_checked', $2, $3)`,
+    [taskId, 'Skill requirements checked', { selected_skills: selectedSkills, requirements: requirementDetails, missing_env: missingEnv, missing_tools: missingTools }]
+  );
+  if (missingEnv.length || missingTools.length) {
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skill_missing_requirements', $2, $3)`,
+      [taskId, 'Skill requirements missing or operator-only', { selected_skills: selectedSkills, missing_env: missingEnv, missing_tools: missingTools }]
+    );
+  }
+  if (context.loadedCustomSkillPaths.length) {
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skill_loaded', $2, $3)`,
+      [taskId, 'Custom skill context loaded', { selected_skills: selectedSkills, loaded_custom_skill_paths: context.loadedCustomSkillPaths }]
+    );
+  }
+  if (context.text) {
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skill_context_attached', $2, $3)`,
+      [taskId, 'Skill context attached to planning context', { selected_skills: selectedSkills, loaded_custom_skill_paths: context.loadedCustomSkillPaths, truncated: context.truncated }]
+    );
+  }
+}
+
 async function createTask(chatId, userId, text, options = {}) {
   const normalized = normalizeInputText(text);
   const dedupeSalt = options.idempotencySalt ? `:${options.idempotencySalt}` : "";
@@ -1033,6 +1106,7 @@ async function createTask(chatId, userId, text, options = {}) {
      values ($1, 'planned', $2)`,
     [taskId, "Task moved to planned"]
   );
+  await logSkillUsageForTask(taskId, text);
   const plannedToPending = await query(
     `update hermes_tasks
      set status='pending_approval',
@@ -1577,9 +1651,9 @@ if (callback) {
       }
 
 
-      if (normalized === "/skills" || normalized === "/skills list" || normalized.startsWith("/skills match ")) {
+      if (normalized === "/skills" || normalized === "/skills list" || normalized.startsWith("/skills match ") || normalized.startsWith("/skills show ") || normalized.startsWith("/skills why ") || normalized === "/skills doctor" || normalized.startsWith("/skills learn")) {
         try {
-          await sendTelegramMessage(chatId, buildSkillsCommandReply(text));
+          await sendTelegramMessage(chatId, await buildSkillsCommandReply(text));
         } catch (err) {
           await sendTelegramMessage(chatId, `Lỗi /skills: ${truncateForTelegram(err.message, 200)}`);
         }

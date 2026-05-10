@@ -48,7 +48,7 @@ assert.equal(registryNames.length, expectedCuratedNames.size, "registry names mu
 
 assert.deepEqual(
   matchSkills("fix docker compose postgres deploy issue").map((skill) => skill.name),
-  ["vps-deploy-runbook", "docker-compose-v1-safety"],
+  ["docker-compose-v1-safety", "systematic-debugging", "postgres-recovery-runbook"],
 );
 
 assert.deepEqual(
