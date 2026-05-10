@@ -126,7 +126,7 @@ function findUnsafeExternalCliCommandMentions(text = '', routedToolName = null) 
   for (const name of TOOL_NAMES) {
     if (routedToolName && name !== routedToolName) continue;
     const escaped = name.replace(/[-/\^$*+?.()|[\]{}]/g, '\\$&');
-    const directCommand = new RegExp(`(?:^|[\\s;&|])(${escaped}\\s+(?:--(?!help\\b|agent\\b)[^.;,\\n]+|(?:enrich|search|run|fetch|lookup|scrape|send|book|print)\\b[^.;,\\n]*))`, 'ig');
+    const directCommand = new RegExp(`(?:^|[\\s;&|])(${escaped}\\s+(?:--[a-z][\\w-]*(?:\\s+\\|\\s*[a-z][\\w-]*\\s+-?\\d+)?|(?:enrich|search|run|fetch|lookup|scrape|send|book|print)\\b[^.;,\\n]*))`, 'ig');
     for (const match of source.matchAll(directCommand)) {
       const candidate = match[1].trim().replace(/\s+/g, ' ');
       if (!safeCommands.has(candidate) && !parseAllowedSmokeCommand(candidate)) unsafe.push(candidate);
@@ -199,15 +199,15 @@ function parseAllowedSmokeCommand(command = '') {
     return { type: 'command-v', tool: match[1] };
   }
 
-  match = trimmed.match(/^([a-z0-9][a-z0-9-]*) --help(?: \| head -(\d{1,2}))?$/);
+  match = trimmed.match(/^([a-z0-9][a-z0-9-]*) --help \| head -(\d{1,2})$/);
   if (match && TOOL_NAMES.includes(match[1])) {
-    const lines = match[2] ? Number(match[2]) : 80;
+    const lines = Number(match[2]);
     if (lines >= 1 && lines <= 80) return { type: 'help', tool: match[1], lines };
   }
 
-  match = trimmed.match(/^([a-z0-9][a-z0-9-]*) --agent(?: \| head -(\d{1,2}))?$/);
+  match = trimmed.match(/^([a-z0-9][a-z0-9-]*) --agent \| head -(\d{1,2})$/);
   if (match && TOOL_NAMES.includes(match[1])) {
-    const lines = match[2] ? Number(match[2]) : 80;
+    const lines = Number(match[2]);
     if (lines >= 1 && lines <= 80) return { type: 'agent', tool: match[1], lines };
   }
 

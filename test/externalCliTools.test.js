@@ -6,11 +6,13 @@ const path = require('node:path');
 
 const {
   buildExternalCliApprovalPlan,
+  parseAllowedSmokeCommand,
   parseSafeRequestedCommands,
   findUnsafeExternalCliCommandMentions,
   ensureApprovedExternalCliActions,
   handleExternalCliTask,
 } = require('../dispatcher/externalCliTools');
+const { canonicalizeApprovalSnapshot, normalizeInputText } = require('../approvalSnapshot');
 
 const smokePrompt = 'Check if company-goat is installed. Only run command -v company-goat and company-goat --help | head -40. Do not run paid enrichment. Do not patch code.';
 const noRunPrompt = 'Use your capability routing inventory. Which tool should handle startup/company diligence? Do not run commands.';
@@ -37,6 +39,23 @@ test('generic git/npm actions are not used for external CLI smoke', () => {
   assert.equal(plan.commands.includes('npm run build'), false);
 });
 
+test('external CLI allowlist requires head for help and agent commands', () => {
+  assert.equal(parseAllowedSmokeCommand('company-goat --help'), null);
+  assert.equal(parseAllowedSmokeCommand('company-goat --agent'), null);
+  assert.deepEqual(parseAllowedSmokeCommand('company-goat --help | head -40'), {
+    type: 'help',
+    tool: 'company-goat',
+    lines: 40,
+  });
+});
+
+test('unsafe help variants without exact head command are rejected', () => {
+  const plan = buildExternalCliApprovalPlan('Check company-goat --help before running anything else.');
+  assert.equal(plan.ok, false);
+  assert.equal(plan.error, 'unsafe_external_cli_command_requested');
+  assert.deepEqual(plan.unsafe_commands, ['company-goat --help']);
+});
+
 test('unsafe external CLI command is rejected', () => {
   const unsafePrompt = 'Use company-goat enrich acme corp. Do not run paid enrichment.';
   const plan = buildExternalCliApprovalPlan(unsafePrompt);
@@ -46,6 +65,34 @@ test('unsafe external CLI command is rejected', () => {
 
   const unsafeMentions = findUnsafeExternalCliCommandMentions('Only run company-goat enrich acme corp.', 'company-goat');
   assert.deepEqual(unsafeMentions, ['company-goat enrich acme corp']);
+});
+
+test('external CLI approval snapshot includes exact actions and structured plan', () => {
+  const plan = buildExternalCliApprovalPlan(smokePrompt);
+  const snapshot = canonicalizeApprovalSnapshot({
+    taskId: 23,
+    payload: {
+      intent: 'external_cli',
+      normalized_input: normalizeInputText(smokePrompt),
+      tool: plan.tool,
+      tool_label: plan.tool_label,
+      execution_plan: plan.plan,
+      risk_level: 'medium',
+      action_list: plan.commands,
+      memory_ids_used: [],
+    },
+    inputText: smokePrompt,
+    intent: 'external_cli',
+    appEnv: 'development',
+  });
+
+  assert.equal(snapshot.intent, 'external_cli');
+  assert.equal(snapshot.tool, 'company-goat');
+  assert.deepEqual(snapshot.action_list, ['command -v company-goat', 'company-goat --help | head -40']);
+  assert.deepEqual(snapshot.execution_plan[2], {
+    commands: ['command -v company-goat', 'company-goat --help | head -40'],
+    step: 'execute_safe_smoke_commands',
+  });
 });
 
 test('worker external CLI guard rejects runtime command list mismatch before execution', () => {
