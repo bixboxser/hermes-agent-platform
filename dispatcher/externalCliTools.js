@@ -97,15 +97,99 @@ function buildPlan(tool, commands) {
 }
 
 function parseSafeRequestedCommands(text = '', routedToolName = null) {
-  const lower = String(text || '').toLowerCase();
+  const source = String(text || '');
   const commands = [];
   for (const name of TOOL_NAMES) {
     if (routedToolName && name !== routedToolName) continue;
-    if (lower.includes(`command -v ${name}`)) commands.push(`command -v ${name}`);
-    if (lower.includes(`${name} --help | head -40`)) commands.push(`${name} --help | head -40`);
-    if (lower.includes(`${name} --agent`)) commands.push(`${name} --agent`);
+    const escaped = name.replace(/[-/\^$*+?.()|[\]{}]/g, '\\$&');
+    const commandV = new RegExp(`(?:^|[^\\w-])(command\\s+-v\\s+${escaped})(?=$|[^\\w-])`, 'ig');
+    const help = new RegExp(`(?:^|[^\\w-])(${escaped}\\s+--help\\s+\\|\\s+head\\s+-([1-9]\\d?))(?=$|[^\\w-])`, 'ig');
+    const agent = new RegExp(`(?:^|[^\\w-])(${escaped}\\s+--agent\\s+\\|\\s+head\\s+-([1-9]\\d?))(?=$|[^\\w-])`, 'ig');
+
+    for (const match of source.matchAll(commandV)) commands.push(`command -v ${name}`);
+    for (const match of source.matchAll(help)) {
+      const lines = Number(match[2]);
+      if (lines >= 1 && lines <= 80) commands.push(`${name} --help | head -${lines}`);
+    }
+    for (const match of source.matchAll(agent)) {
+      const lines = Number(match[2]);
+      if (lines >= 1 && lines <= 80) commands.push(`${name} --agent | head -${lines}`);
+    }
   }
   return [...new Set(commands)];
+}
+
+function findUnsafeExternalCliCommandMentions(text = '', routedToolName = null) {
+  const source = String(text || '');
+  const safeCommands = new Set(parseSafeRequestedCommands(source, routedToolName));
+  const unsafe = [];
+  for (const name of TOOL_NAMES) {
+    if (routedToolName && name !== routedToolName) continue;
+    const escaped = name.replace(/[-/\^$*+?.()|[\]{}]/g, '\\$&');
+    const directCommand = new RegExp(`(?:^|[\\s;&|])(${escaped}\\s+(?:--(?!help\\b|agent\\b)[^.;,\\n]+|(?:enrich|search|run|fetch|lookup|scrape|send|book|print)\\b[^.;,\\n]*))`, 'ig');
+    for (const match of source.matchAll(directCommand)) {
+      const candidate = match[1].trim().replace(/\s+/g, ' ');
+      if (!safeCommands.has(candidate) && !parseAllowedSmokeCommand(candidate)) unsafe.push(candidate);
+    }
+  }
+  return [...new Set(unsafe)];
+}
+
+function buildExternalCliApprovalPlan(text = '') {
+  if (!isExternalCliTask(text) || mentionsNoRun(text)) return null;
+  const tool = routeTool(text);
+  if (!tool) return null;
+  const commands = parseSafeRequestedCommands(text, tool.name);
+  const unsafeCommands = findUnsafeExternalCliCommandMentions(text, tool.name);
+  if (commands.length === 0 || unsafeCommands.length > 0) {
+    return {
+      ok: false,
+      intent: 'external_cli',
+      tool: tool.name,
+      tool_label: tool.label,
+      commands,
+      unsafe_commands: unsafeCommands,
+      plan: buildPlan(tool, commands),
+      error: unsafeCommands.length > 0 ? 'unsafe_external_cli_command_requested' : 'no_safe_external_cli_commands_requested',
+    };
+  }
+  return {
+    ok: true,
+    intent: 'external_cli',
+    tool: tool.name,
+    tool_label: tool.label,
+    commands,
+    unsafe_commands: [],
+    plan: buildPlan(tool, commands),
+  };
+}
+
+function approvedExternalCliActionsFromSnapshot(snapshot = {}) {
+  const payload = snapshot?.payload && typeof snapshot.payload === 'object' ? snapshot.payload : snapshot;
+  if ((payload.intent || payload.task_intent) !== 'external_cli') return null;
+  return Array.isArray(payload.action_list) ? payload.action_list : [];
+}
+
+function ensureApprovedExternalCliActions(runtimeCommands = [], approvedCommands = []) {
+  const runtime = Array.isArray(runtimeCommands) ? runtimeCommands : [];
+  const approved = Array.isArray(approvedCommands) ? approvedCommands : [];
+  const same = runtime.length === approved.length && runtime.every((cmd, idx) => cmd === approved[idx]);
+  if (!same) {
+    const err = new Error('external_cli_action_mismatch');
+    err.code = 'external_cli_action_mismatch';
+    err.runtimeCommands = runtime;
+    err.approvedCommands = approved;
+    throw err;
+  }
+  for (const command of runtime) {
+    if (!parseAllowedSmokeCommand(command)) {
+      const err = new Error('external_cli_action_not_allowlisted');
+      err.code = 'external_cli_action_not_allowlisted';
+      err.command = command;
+      throw err;
+    }
+  }
+  return true;
 }
 
 function parseAllowedSmokeCommand(command = '') {
@@ -174,9 +258,10 @@ async function handleExternalCliTask(task, deps) {
   if (!isExternalCliTask(text)) return null;
 
   const tool = routeTool(text);
-  let commands = mentionsNoRun(text) ? [] : parseSafeRequestedCommands(text, tool?.name || null);
-  if (!mentionsNoRun(text) && tool && commands.length === 0) {
-    commands = [`command -v ${tool.name}`, `${tool.name} --help | head -40`];
+  const commands = mentionsNoRun(text) ? [] : parseSafeRequestedCommands(text, tool?.name || null);
+  const approvedCommands = deps.approvedCommands || null;
+  if (approvedCommands) {
+    ensureApprovedExternalCliActions(commands, approvedCommands);
   }
   const plan = buildPlan(tool, commands);
 
@@ -230,6 +315,10 @@ module.exports = {
   isExternalCliTask,
   parseAllowedSmokeCommand,
   parseSafeRequestedCommands,
+  findUnsafeExternalCliCommandMentions,
+  buildExternalCliApprovalPlan,
+  approvedExternalCliActionsFromSnapshot,
+  ensureApprovedExternalCliActions,
   runAllowedSmokeCommand,
   handleExternalCliTask,
 };
