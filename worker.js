@@ -16,8 +16,9 @@ const { handleTaskFailure } = require('./dispatcher/autodebug');
 const { createPlanForTask, taskType } = require('./dispatcher/planner');
 const { executePlan } = require('./dispatcher/executor');
 const { runDueGoals } = require('./dispatcher/goalRunner');
-const { handleExternalCliTask, approvedExternalCliActionsFromSnapshot } = require('./dispatcher/externalCliTools');
-const { buildSkillContext, matchSkills, checkSkillRequirements } = require('./skills/registry');
+const { runGoalTask } = require("./dispatcher/goals");
+const { handleExternalCliTask, approvedExternalActionsFromSnapshot } = require("./dispatcher/externalCliTools");
+const { buildSkillContext, matchSkills, checkSkillRequirements } = require("./skills/registry");
 
 const rawExecAsync = promisify(exec);
 const { canonicalizeApprovalSnapshot, hashApprovalSnapshot } = require('./approvalSnapshot');
@@ -1206,7 +1207,7 @@ async function processOneTask() {
     await event(task.id, "execution_started", "Worker started task");
     await query(`update hermes_tasks set execution_started_at=now(), updated_at=now() where id=$1`, [task.id]);
 
-    const approvedExternalCliCommands = approvedExternalCliActionsFromSnapshot(approvalTask?.approval_snapshot_payload || {});
+    const approvedExternalCliCommands = approvedExternalActionsFromSnapshot(approvalTask?.approval_snapshot_payload || {});
     let externalCliResult;
     try {
       externalCliResult = await handleExternalCliTask(task, { query, event, approvedCommands: approvedExternalCliCommands || [] });

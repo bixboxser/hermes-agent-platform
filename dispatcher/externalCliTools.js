@@ -170,6 +170,10 @@ function approvedExternalCliActionsFromSnapshot(snapshot = {}) {
   return Array.isArray(payload.action_list) ? payload.action_list : [];
 }
 
+function approvedExternalActionsFromSnapshot(snapshot = {}) {
+  return approvedExternalCliActionsFromSnapshot(snapshot);
+}
+
 function ensureApprovedExternalCliActions(runtimeCommands = [], approvedCommands = []) {
   const runtime = Array.isArray(runtimeCommands) ? runtimeCommands : [];
   const approved = Array.isArray(approvedCommands) ? approvedCommands : [];
@@ -318,6 +322,7 @@ module.exports = {
   findUnsafeExternalCliCommandMentions,
   buildExternalCliApprovalPlan,
   approvedExternalCliActionsFromSnapshot,
+  approvedExternalActionsFromSnapshot,
   ensureApprovedExternalCliActions,
   runAllowedSmokeCommand,
   handleExternalCliTask,

@@ -14,10 +14,6 @@ test('worker.js resolves external CLI and skill registry import conflict', () =>
   }
   assert.match(
     worker,
-    /const \{ handleExternalCliTask, approvedExternalCliActionsFromSnapshot \} = require\('\.\/dispatcher\/externalCliTools'\);/,
-  );
-  assert.match(
-    worker,
-    /const \{ buildSkillContext, matchSkills, checkSkillRequirements \} = require\('\.\/skills\/registry'\);/,
+    /const \{ runGoalTask \} = require\("\.\/dispatcher\/goals"\);\nconst \{ handleExternalCliTask, approvedExternalActionsFromSnapshot \} = require\("\.\/dispatcher\/externalCliTools"\);\nconst \{ buildSkillContext, matchSkills, checkSkillRequirements \} = require\("\.\/skills\/registry"\);/,
   );
 });
