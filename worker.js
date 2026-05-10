@@ -17,6 +17,7 @@ const { createPlanForTask, taskType } = require('./dispatcher/planner');
 const { executePlan } = require('./dispatcher/executor');
 const { runDueGoals } = require('./dispatcher/goalRunner');
 const { handleExternalCliTask, approvedExternalCliActionsFromSnapshot } = require('./dispatcher/externalCliTools');
+const { buildSkillContext, matchSkills, checkSkillRequirements } = require('./skills/registry');
 
 const rawExecAsync = promisify(exec);
 const { canonicalizeApprovalSnapshot, hashApprovalSnapshot } = require('./approvalSnapshot');

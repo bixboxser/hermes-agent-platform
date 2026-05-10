@@ -110,6 +110,17 @@ function checkSkillRequirements(skill, env = process.env) {
   };
 }
 
+function buildSkillContext(queryText, options = {}) {
+  const skills = matchSkills(queryText, options.limit || 3);
+  return {
+    input: String(queryText || ''),
+    skills: skills.map((skill) => ({
+      ...skill,
+      requirements: checkSkillRequirements(skill, options.env || process.env),
+    })),
+  };
+}
+
 function classifyTelegramSkillIntent(text) {
   const normalized = String(text || "").trim().toLowerCase();
   if (!normalized || ["hi", "hello", "hey", "chào", "chao", "alo", "ok", "ping", "test"].includes(normalized)) {
@@ -155,6 +166,7 @@ module.exports = {
   getSkillRegistry,
   matchSkills,
   checkSkillRequirements,
+  buildSkillContext,
   classifyTelegramSkillIntent,
   loadCustomSkillMarkdown,
   formatSkillsList,
