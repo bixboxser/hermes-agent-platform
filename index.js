@@ -4,6 +4,7 @@ const axios = require("axios");
 const { query } = require("./db");
 const { canonicalizeApprovalSnapshot, hashApprovalSnapshot, normalizeInputText } = require("./approvalSnapshot");
 const { getSystemHealth } = require("./dispatcher/health");
+const { formatSkillsList, formatSkillMatches, classifyTelegramSkillIntent } = require("./skills/registry");
 const {
   ensureGBrainSchema,
   learnFromText,
@@ -679,6 +680,27 @@ function buildUnknownTelegramReply(text) {
   ].join("\n");
 }
 
+
+
+function buildSkillsCommandReply(text) {
+  const input = String(text || "").trim();
+  if (/^\/skills(?:@\w+)?\s+list$/i.test(input) || /^\/skills(?:@\w+)?$/i.test(input)) {
+    return `Curated Hermes Skill Pack v1\n\n${formatSkillsList()}\n\nRouting: classify intent → match top 1-3 skills → check env/tools → load selected SKILL.md only → plan → require approval for risky/prod actions → execute → verify → save lessons.`;
+  }
+
+  const match = input.match(/^\/skills(?:@\w+)?\s+match\s+([\s\S]+)$/i);
+  if (!match) {
+    return "Dùng: /skills list hoặc /skills match <task>";
+  }
+
+  const queryText = match[1].trim();
+  if (!queryText) return "Dùng: /skills match <task>";
+  const routed = classifyTelegramSkillIntent(queryText);
+  if (routed.intent === "small_talk") {
+    return "Small-talk detected: no heavy task flow and no SKILL.md loaded.";
+  }
+  return formatSkillMatches(queryText, { limit: 3 });
+}
 
 function redactSensitiveText(value) {
   return String(value || "")
@@ -1533,6 +1555,17 @@ if (callback) {
         continue;
       }
 
+
+      if (normalized === "/skills" || normalized === "/skills list" || normalized.startsWith("/skills match ")) {
+        try {
+          await sendTelegramMessage(chatId, buildSkillsCommandReply(text));
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /skills: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /skills", { userId, chatId });
+        continue;
+      }
+
       if (normalized === "/status") {
         try {
           await sendTelegramMessage(chatId, await buildTelegramStatusMessage());
@@ -1695,6 +1728,7 @@ if (callback) {
 /status — system health
 /queue — queue summary
 /pending — pending approvals
+/skills list|match <task> — curated Hermes Skill Pack v1
 /task <id> — task details
 /events <id> — task event timeline
 /approve <id> — approve pending task
