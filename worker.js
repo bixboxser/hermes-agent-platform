@@ -16,6 +16,7 @@ const { handleTaskFailure } = require('./dispatcher/autodebug');
 const { createPlanForTask, taskType } = require('./dispatcher/planner');
 const { executePlan } = require('./dispatcher/executor');
 const { runDueGoals } = require('./dispatcher/goalRunner');
+const { handleExternalCliTask } = require('./dispatcher/externalCliTools');
 
 const rawExecAsync = promisify(exec);
 const { canonicalizeApprovalSnapshot, hashApprovalSnapshot } = require('./approvalSnapshot');
@@ -1203,6 +1204,42 @@ async function processOneTask() {
     const session = await getOrCreateSession(task.id);
     await event(task.id, "execution_started", "Worker started task");
     await query(`update hermes_tasks set execution_started_at=now(), updated_at=now() where id=$1`, [task.id]);
+
+    const externalCliResult = await handleExternalCliTask(task, { query, event });
+    if (externalCliResult) {
+      const finalResult = {
+        status: externalCliResult.status === 'completed' ? 'completed' : 'failed',
+        review_status: externalCliResult.status === 'completed' ? 'approved' : 'rejected',
+        issues: externalCliResult.status === 'completed' ? [] : [externalCliResult.output || 'external_cli_failed'],
+        output: externalCliResult.output,
+      };
+      await updateSession(task.id, { status: finalResult.status, last_gate_status: finalResult.review_status === 'approved' ? 'passed' : 'failed' });
+      await logSessionAction(session.id, 'external_cli', finalResult.review_status, finalResult);
+      if (finalResult.status === 'completed') {
+        await releaseTask(task.id, WORKER_ID, 'completed', JSON.stringify(finalResult));
+      } else {
+        await failTask(task.id, WORKER_ID, finalResult.issues.join('; '), false);
+      }
+      await query(`update hermes_tasks set execution_completed_at=now(), duration_ms=extract(epoch from (now()-coalesce(execution_started_at,now())))*1000, result_summary=$2::jsonb where id=$1`, [task.id, JSON.stringify({
+        task_id: task.id,
+        final_status: finalResult.status,
+        intent: 'external_cli',
+        approval_status: 'approved',
+        actions_attempted: externalCliResult.commands?.length || 0,
+        actions_succeeded: (externalCliResult.results || []).filter((r) => r.status === 'completed').length,
+        actions_failed: (externalCliResult.results || []).filter((r) => r.status !== 'completed').length,
+        actions: externalCliResult.commands || [],
+        key_output: externalCliResult.output,
+        safe_error: finalResult.status === 'completed' ? null : finalResult.issues.join('; '),
+        next_operator_action: 'Use /task to inspect logs, or approve a safe smoke command if needed.',
+        confidence_level: 'medium',
+      })]);
+      await event(task.id, "execution_completed", "External CLI routing completed", { tool: externalCliResult.tool, commands: externalCliResult.commands || [] });
+      clearInterval(heartbeatTimer);
+      await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} external CLI result:
+${String(externalCliResult.output || '').slice(0, 3000)}`, null, task.telegram_user_id);
+      return;
+    }
 
     await event(task.id, "plan_started", "Planning started");
     const plan = await createPlanForTask(task);

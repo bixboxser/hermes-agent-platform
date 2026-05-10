@@ -17,6 +17,7 @@ const {
   buildAudit,
   buildDeployCheck,
 } = require("./gbrain");
+const { isExternalCliTask, routeTool } = require('./dispatcher/externalCliTools');
 const app = express();
 app.use(express.json());
 
@@ -653,7 +654,7 @@ function isCasualTelegramInput(text) {
 
 function isTaskLikeTelegramInput(text) {
   const normalizedIntentText = normalizeTelegramIntentText(text);
-  return TASK_LIKE_TELEGRAM_PATTERNS.some((pattern) => pattern.test(normalizedIntentText));
+  return isExternalCliTask(normalizedIntentText) || TASK_LIKE_TELEGRAM_PATTERNS.some((pattern) => pattern.test(normalizedIntentText));
 }
 
 function buildCasualTelegramReply() {
@@ -2320,6 +2321,14 @@ NEXT ACTION:
       if (!isTaskLikeTelegramInput(text)) {
         console.log("UNKNOWN_INTENT_CLARIFICATION", { userId, chatId, text });
         await sendTelegramMessage(chatId, buildUnknownTelegramReply(text));
+        continue;
+      }
+
+      if (isExternalCliTask(text) && /do not run commands|don't run commands|no commands|không chạy lệnh/i.test(text)) {
+        const tool = routeTool(text);
+        await sendTelegramMessage(chatId, tool
+          ? `Recommended tool: ${tool.name} (${tool.label}). No commands were run.`
+          : 'No remembered capability tool matched this request. No commands were run.');
         continue;
       }
 
