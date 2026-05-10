@@ -17,6 +17,7 @@ const { createPlanForTask, taskType } = require('./dispatcher/planner');
 const { executePlan } = require('./dispatcher/executor');
 const { runDueGoals } = require('./dispatcher/goalRunner');
 const { handleExternalCliTask } = require('./dispatcher/externalCliTools');
+const { buildSkillContext, matchSkills, checkSkillRequirements } = require('./skills/registry');
 
 const rawExecAsync = promisify(exec);
 const { canonicalizeApprovalSnapshot, hashApprovalSnapshot } = require('./approvalSnapshot');
@@ -154,6 +155,50 @@ async function persistBlockedApprovalFailure(task, safeError, approvalStatus) {
   );
   await event(task.id, "failed", safeError, summary);
   await safeNotifyOperator(task, safeError, `❌ Task #${task.id} failed: ${safeError}\n${JSON.stringify(summary)}`);
+}
+
+async function attachSkillContextForWorker(task) {
+  const selected = matchSkills(task.input_text || '', 3);
+  if (!selected.length) return null;
+  const selectedSkills = selected.map((skill) => ({ name: skill.name, score: skill.score }));
+  const requirementDetails = selected.map((skill) => {
+    const req = checkSkillRequirements(skill, process.env);
+    return {
+      name: skill.name,
+      missingEnv: req.missingEnv,
+      missingTools: req.missingTools,
+      hostOperatorTools: req.hostOperatorTools,
+      ok: req.ok,
+    };
+  });
+  const context = buildSkillContext(task.input_text || '', { limit: 3 });
+  await event(task.id, 'skills_matched', 'Worker matched skills for planning', { selected_skills: selectedSkills });
+  await event(task.id, 'skill_requirements_checked', 'Worker checked skill requirements', { selected_skills: selectedSkills, requirements: requirementDetails, missing_env: [...new Set(requirementDetails.flatMap((r) => r.missingEnv || []))], missing_tools: [...new Set(requirementDetails.flatMap((r) => r.missingTools || []))] });
+  if (requirementDetails.some((r) => (r.missingEnv || []).length || (r.missingTools || []).length)) {
+    await event(task.id, 'skill_missing_requirements', 'Skill requirements missing or operator-only', { selected_skills: selectedSkills, missing_env: [...new Set(requirementDetails.flatMap((r) => r.missingEnv || []))], missing_tools: [...new Set(requirementDetails.flatMap((r) => r.missingTools || []))] });
+  }
+  if (context.loadedCustomSkillPaths.length) {
+    await event(task.id, 'skill_loaded', 'Custom skill files loaded for planning', { selected_skills: selectedSkills, loaded_custom_skill_paths: context.loadedCustomSkillPaths });
+  }
+  if (context.text) {
+    await event(task.id, 'skill_context_attached', 'Skill context attached to planner', { selected_skills: selectedSkills, loaded_custom_skill_paths: context.loadedCustomSkillPaths, truncated: context.truncated });
+  }
+  return context;
+}
+
+async function createSkillLessonCandidate(task, status, detail = '') {
+  const text = `${task.input_text || ''}
+${detail || ''}`.toLowerCase();
+  let lesson = '';
+  if (/missing|not found|command.*not|env|credential|google_application_credentials|requires_host_operator|docker|psql/.test(text)) {
+    lesson = 'Potential lesson to save: record the missing env/tool preflight and operator handoff for similar skill-matched tasks.';
+  } else if (/deploy|runtime|worker|health|postgres|docker/.test(text)) {
+    lesson = 'Potential lesson to save: capture the deploy/runtime verification pattern that resolved or diagnosed this task.';
+  } else if (status === 'completed') {
+    lesson = 'Potential lesson to save: reuse the successful verification pattern from this task when the same skill match appears again.';
+  }
+  if (!lesson) return;
+  await event(task.id, 'skill_lesson_candidate', lesson, { status, lesson_candidate: lesson });
 }
 
 async function logAction(taskId, actionName, input, output, status) {
@@ -1235,6 +1280,7 @@ async function processOneTask() {
         confidence_level: 'medium',
       })]);
       await event(task.id, "execution_completed", "External CLI routing completed", { tool: externalCliResult.tool, commands: externalCliResult.commands || [] });
+      await createSkillLessonCandidate(task, finalResult.status, externalCliResult.output || '');
       clearInterval(heartbeatTimer);
       await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} external CLI result:
 ${String(externalCliResult.output || '').slice(0, 3000)}`, null, task.telegram_user_id);
@@ -1242,6 +1288,8 @@ ${String(externalCliResult.output || '').slice(0, 3000)}`, null, task.telegram_u
     }
 
     await event(task.id, "plan_started", "Planning started");
+    const skillContext = await attachSkillContextForWorker(task);
+    if (skillContext?.text) task.skill_context = skillContext.text;
     const plan = await createPlanForTask(task);
     await event(task.id, "plan_created", "Plan created", { plan_id: plan.id });
     await safeNotifyOperator(task, 'plan_created', `🧠 Task #${task.id}: Đã tạo kế hoạch thực thi.`);
@@ -1256,10 +1304,12 @@ ${String(externalCliResult.output || '').slice(0, 3000)}`, null, task.telegram_u
       await releaseTask(task.id, WORKER_ID, 'completed', JSON.stringify(finalResult));
       await query(`update hermes_tasks set execution_completed_at=now(), duration_ms=extract(epoch from (now()-coalesce(execution_started_at,now())))*1000, result_summary=$2::jsonb where id=$1`, [task.id, JSON.stringify({ task_id: task.id, final_status: 'completed', intent: task.intent || 'execute', approval_status: 'approved', actions_attempted: 0, actions_succeeded: 0, actions_failed: 0, actions: [], key_output: 'Task approved.', safe_error: null, next_operator_action: 'Có thể chạy /task để xem chi tiết.', confidence_level: 'high' })]);
       await event(task.id, "execution_completed", "Execution completed");
+      await createSkillLessonCandidate(task, 'completed', finalResult.output || 'Task approved.');
       await safeNotifyOperator(task, 'execution_completed', `✅ Task #${task.id} hoàn tất.`);
     } else {
       await failTask(task.id, WORKER_ID, (finalResult.issues || []).join('; '), false);
       await event(task.id, "execution_failed", "Execution failed", { issues: finalResult.issues || [] });
+      await createSkillLessonCandidate(task, 'failed', (finalResult.issues || []).join('; '));
       await safeNotifyOperator(task, 'execution_failed', `❌ Task #${task.id} thất bại: ${(finalResult.issues || ['unknown']).join('; ')}`);
     }
 
@@ -1289,6 +1339,7 @@ ${String(externalCliResult.output || '').slice(0, 3000)}`, null, task.telegram_u
     await failTask(task.id, WORKER_ID, errorText, Boolean(debug.retryable));
 
     await event(task.id, "failed", errorText, enriched);
+    await createSkillLessonCandidate(task, 'failed', errorText);
     await sendTelegramMessage(task.telegram_chat_id, `Plan failed at step ${session.current_step_id || '-'}`, null, task.telegram_user_id).catch(()=>{});
     await sendTelegramMessage(task.telegram_chat_id, `Task #${task.id} result:
 ${JSON.stringify(enriched)}`, null, task.telegram_user_id);
