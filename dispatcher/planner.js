@@ -31,6 +31,13 @@ async function createPlanForTask(task) {
       [plan.id, i + 1, stepTypes[i]]
     );
   }
+  if (task.skill_context) {
+    await query(
+      `insert into hermes_task_events (task_id, event_type, message, payload)
+       values ($1, 'skill_context_attached', $2, $3)`,
+      [task.id, 'Skill Context available to planner', { truncated: task.skill_context.includes('[Skill Context truncated]') }]
+    );
+  }
   console.log('PLAN_CREATED', { taskId: task.id, planId: plan.id });
   return plan;
 }
