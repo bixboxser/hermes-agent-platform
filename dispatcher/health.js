@@ -1,19 +1,20 @@
 const { query } = require('../db');
 const envConfig = require('../config/env');
 
-async function safeQuery(sql, params = []) {
+async function safeQuery(sql, params = [], queryFn = query) {
   try {
-    const result = await query(sql, params);
+    const result = await queryFn(sql, params);
     return { ok: true, rows: result.rows || [] };
   } catch (error) {
     return { ok: false, rows: [], error: error.message };
   }
 }
 
-async function getSystemHealth() {
+async function getSystemHealth(options = {}) {
+  const queryFn = options.queryFn || query;
   const warnings = [];
 
-  const dbPing = await safeQuery('select 1');
+  const dbPing = await safeQuery('select 1', [], queryFn);
   const dbOk = dbPing.ok;
   if (!dbOk) warnings.push(`DB ping failed: ${dbPing.error}`);
 
@@ -23,6 +24,8 @@ async function getSystemHealth() {
          from hermes_worker_status
          order by last_heartbeat_at desc
          limit 1`,
+        [],
+        queryFn,
       )
     : { ok: false, rows: [], error: dbPing.error };
   if (!worker.ok) warnings.push(`Worker status unavailable: ${worker.error}`);
@@ -40,6 +43,8 @@ async function getSystemHealth() {
           coalesce(sum(case when status='failed' and updated_at >= now() - interval '24 hours' then 1 else 0 end), 0)::int as failed_24h,
           coalesce(sum(case when status='failed' then 1 else 0 end), 0)::int as failed_total
          from hermes_tasks`,
+        [],
+        queryFn,
       )
     : { ok: false, rows: [], error: dbPing.error };
   if (!queue.ok) warnings.push(`Queue counts unavailable: ${queue.error}`);
@@ -51,6 +56,8 @@ async function getSystemHealth() {
           coalesce(extract(epoch from (now() - min(case when status='pending_approval' then created_at end)))::int, 0) as oldest_pending_approval_seconds
          from hermes_tasks
          where status in ('pending','pending_approval')`,
+        [],
+        queryFn,
       )
     : { ok: false, rows: [], error: dbPing.error };
   if (!oldest.ok) warnings.push(`Queue age unavailable: ${oldest.error}`);
@@ -61,6 +68,8 @@ async function getSystemHealth() {
          from hermes_tasks
          where status='running'
            and heartbeat_at < now() - interval '10 minutes'`,
+        [],
+        queryFn,
       )
     : { ok: false, rows: [], error: dbPing.error };
   if (!stuck.ok) warnings.push(`Stuck running count unavailable: ${stuck.error}`);
@@ -71,12 +80,14 @@ async function getSystemHealth() {
          from hermes_tasks
          order by id desc
          limit 1`,
+        [],
+        queryFn,
       )
     : { ok: false, rows: [], error: dbPing.error };
   if (!latestTask.ok) warnings.push(`Latest task unavailable: ${latestTask.error}`);
 
   const memory = dbOk
-    ? await safeQuery(`select count(*)::int as total from hermes_memories`)
+    ? await safeQuery(`select count(*)::int as total from hermes_memories`, [], queryFn)
     : { ok: false, rows: [], error: dbPing.error };
   if (!memory.ok) warnings.push(`Memory count unavailable: ${memory.error}`);
 
