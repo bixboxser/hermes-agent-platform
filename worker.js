@@ -1240,7 +1240,25 @@ async function processOneTask() {
     await event(task.id, "execution_started", "Worker started task");
     await query(`update hermes_tasks set execution_started_at=now(), updated_at=now() where id=$1`, [task.id]);
 
-    const externalCliResult = await handleExternalCliTask(task, { query, event });
+    const approvedExternalCliCommands = approvedExternalActionsFromSnapshot(approvalTask?.approval_snapshot_payload || {});
+    let externalCliResult;
+    try {
+      externalCliResult = await handleExternalCliTask(task, { query, event, approvedCommands: approvedExternalCliCommands || [] });
+    } catch (err) {
+      if (err.code === 'external_cli_action_mismatch' || err.code === 'external_cli_action_not_allowlisted') {
+        await event(task.id, err.code, 'External CLI command list differed from approved approval snapshot', {
+          runtime_commands: err.runtimeCommands || [],
+          approved_commands: err.approvedCommands || approvedExternalCliCommands || [],
+          command: err.command || null,
+        });
+        await safeNotifyOperator(task, err.code, `🛑 Task #${task.id}: ${err.code}`);
+        await persistBlockedApprovalFailure(task, err.code, 'invalidated');
+        await failTask(task.id, WORKER_ID, err.code, false);
+        clearInterval(heartbeatTimer);
+        return;
+      }
+      throw err;
+    }
     if (externalCliResult) {
       const finalResult = {
         status: externalCliResult.status === 'completed' ? 'completed' : 'failed',
