@@ -30,6 +30,7 @@ const {
   buildDeployCheck,
 } = require("./gbrain");
 const { isExternalCliTask, routeTool, buildExternalCliApprovalPlan } = require('./dispatcher/externalCliTools');
+const { isHostCommand, buildHostCommandReply } = require('./dispatcher/hostReadOnly');
 const app = express();
 app.use(express.json());
 
@@ -1874,6 +1875,20 @@ if (callback) {
       }
 
 
+      if (isHostCommand(text)) {
+        try {
+          await sendTelegramMessage(chatId, await buildHostCommandReply(text, {
+            userId,
+            allowedUserIds: ALLOWED_USER_IDS,
+            repoRoot: process.cwd(),
+          }));
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /host: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /host", { userId, chatId });
+        continue;
+      }
+
       if (normalized === "/skills" || normalized === "/skills list" || normalized.startsWith("/skills match ") || normalized.startsWith("/skills show ") || normalized.startsWith("/skills why ") || normalized === "/skills doctor" || normalized.startsWith("/skills learn") || normalized.startsWith("/skills save-memory")) {
         try {
           await sendTelegramMessage(chatId, await buildSkillsCommandReply(text));
@@ -2054,6 +2069,7 @@ if (callback) {
   await sendTelegramMessage(chatId, `📚 Hermes Commands
 
 /status — system health
+/host health|docker-ps|logs app|logs worker|db-status|git-status — read-only host diagnostics
 /queue — queue summary
 /tasks summary|stale|expire-stale — task hygiene
 /pending — pending approvals
@@ -2799,6 +2815,8 @@ module.exports = {
   expireStaleTasks,
   buildTasksExpireStaleMessage,
   buildTasksSummaryMessage,
+  buildHostCommandReply,
+  isHostCommand,
   isTaskStale,
   isCasualTelegramInput,
   isTaskLikeTelegramInput,
