@@ -15,6 +15,7 @@ const DOCKER_PS_CONTAINERS = ['hermes_app', 'hermes_worker', 'hermes_db'];
 const HOST_COMMAND_TIMEOUT_MS = 8000;
 const HOST_COMMAND_MAX_BUFFER = 512 * 1024;
 const DB_UNAVAILABLE_MESSAGE = 'psql is host/operator tool required; DB status unavailable from container.';
+const DOCKER_HOST_DIAGNOSTICS_UNAVAILABLE_MESSAGE = 'Docker host diagnostics unavailable from this container. docker CLI is not installed and no safe host wrapper is configured.';
 
 const BLOCKED_COMMAND_PATTERNS = [
   /docker-compose\s+down/i,
@@ -107,6 +108,14 @@ function buildGitStatusCommands() {
   return commands;
 }
 
+function isMissingDockerCliError(command, err = {}) {
+  if (command?.file !== 'docker') return false;
+  const detail = [err.code, err.errno, err.syscall, err.path, err.message, err.stderr]
+    .filter(Boolean)
+    .join(' ');
+  return /\bENOENT\b/i.test(detail) || /spawn\s+docker\s+ENOENT/i.test(detail);
+}
+
 async function runReadOnlyCommand(command, options = {}) {
   assertNoBlockedCommand(commandToText(command.file, command.args));
   const execFileFn = options.execFileFn || execFileAsync;
@@ -120,6 +129,14 @@ async function runReadOnlyCommand(command, options = {}) {
     });
     return { ok: true, stdout: redactSensitiveText(result.stdout || ''), stderr: redactSensitiveText(result.stderr || '') };
   } catch (err) {
+    if (isMissingDockerCliError(command, err)) {
+      return {
+        ok: false,
+        stdout: '',
+        stderr: DOCKER_HOST_DIAGNOSTICS_UNAVAILABLE_MESSAGE,
+        unavailableReason: 'docker_cli_missing',
+      };
+    }
     return {
       ok: false,
       stdout: redactSensitiveText(err.stdout || ''),
@@ -165,7 +182,13 @@ function formatHostHealth(healthResult) {
   ].join('\n'));
 }
 
+function isDockerDiagnosticsUnavailable(result = {}) {
+  return result.unavailableReason === 'docker_cli_missing'
+    || result.stderr === DOCKER_HOST_DIAGNOSTICS_UNAVAILABLE_MESSAGE;
+}
+
 function formatDockerPsOutput(result) {
+  if (isDockerDiagnosticsUnavailable(result)) return DOCKER_HOST_DIAGNOSTICS_UNAVAILABLE_MESSAGE;
   if (!result.ok) return `Host docker-ps (read-only)\n- unavailable: ${redactSensitiveText(result.stderr || 'docker ps failed')}`;
   const lines = String(result.stdout || '').trim().split('\n').filter(Boolean);
   if (!lines.length) return 'Host docker-ps (read-only)\n- no hermes containers found';
@@ -177,6 +200,7 @@ function formatDockerPsOutput(result) {
 }
 
 function formatLogsOutput(target, command, result) {
+  if (isDockerDiagnosticsUnavailable(result)) return DOCKER_HOST_DIAGNOSTICS_UNAVAILABLE_MESSAGE;
   const header = `Host logs ${target} (read-only, tail=${command.lines})`;
   const output = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
   if (!result.ok && !output) return `${header}\n- unavailable: docker logs failed`;
@@ -275,6 +299,7 @@ module.exports = {
   DEFAULT_LOG_LINES,
   MAX_LOG_LINES,
   DB_UNAVAILABLE_MESSAGE,
+  DOCKER_HOST_DIAGNOSTICS_UNAVAILABLE_MESSAGE,
   redactSensitiveText,
   parseLogLineLimit,
   assertNoBlockedCommand,
@@ -282,6 +307,7 @@ module.exports = {
   buildDockerLogsCommand,
   buildGitStatusCommands,
   buildDbStatusMessage,
+  runReadOnlyCommand,
   buildHostCommandReply,
   isHostCommand,
   isOperatorAuthorized,
