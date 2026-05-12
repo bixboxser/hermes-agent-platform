@@ -14,7 +14,7 @@ services:
       - APP_ENV=production
       - HERMES_ENV=prod
       - DATABASE_URL=postgres://hermes:hermes_password@hermes_db:5432/hermes
-      - HERMES_INSTALL_PRINTING_PRESS_CLIS=true
+      - HERMES_INSTALL_PRINTING_PRESS_CLIS=false
       - GIT_AUTHOR_NAME=Mason
       - GIT_AUTHOR_EMAIL=nguyenminhquanlcdn@gmail.com
       - GIT_COMMITTER_NAME=Mason
@@ -47,7 +47,7 @@ services:
       - APP_ENV=production
       - HERMES_ENV=prod
       - DATABASE_URL=postgres://hermes:hermes_password@hermes_db:5432/hermes
-      - HERMES_INSTALL_PRINTING_PRESS_CLIS=true
+      - HERMES_INSTALL_PRINTING_PRESS_CLIS=false
       - GIT_AUTHOR_NAME=Mason
       - GIT_AUTHOR_EMAIL=nguyenminhquanlcdn@gmail.com
       - GIT_COMMITTER_NAME=Mason
