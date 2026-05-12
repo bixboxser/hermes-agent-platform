@@ -694,7 +694,112 @@ function buildUnknownTelegramReply(text) {
 
 
 
-async function buildSkillsCommandReply(text) {
+
+function extractLessonCandidateText(event) {
+  const payload = event?.payload || event?.metadata || {};
+  return payload.lesson_candidate || payload.lesson || event?.message || "";
+}
+
+function summarizeSkillEvents(events) {
+  const summary = { selectedSkills: [], missingEnv: [], missingTools: [] };
+  for (const event of events || []) {
+    const data = event.payload || event.metadata || {};
+    if (Array.isArray(data.selected_skills)) {
+      summary.selectedSkills = data.selected_skills.map((skill) => skill.name || skill).filter(Boolean);
+    }
+    if (Array.isArray(data.selected_skill_names)) summary.selectedSkills = data.selected_skill_names.filter(Boolean);
+    if (Array.isArray(data.missing_env)) summary.missingEnv = data.missing_env.filter(Boolean);
+    if (Array.isArray(data.missing_tools)) summary.missingTools = data.missing_tools.filter(Boolean);
+  }
+  return summary;
+}
+
+async function getSkillLessonReview(taskId, options = {}) {
+  const queryFn = options.queryFn || query;
+  const taskRes = await queryFn(
+    `select id,status,input_text from hermes_tasks where id=$1 limit 1`,
+    [taskId],
+  );
+  const task = taskRes.rows[0];
+  if (!task) return { task: null, candidate: null, events: [] };
+  let eventsRes;
+  try {
+    eventsRes = await queryFn(
+      `select event_type,message,payload,metadata,created_at
+       from hermes_task_events
+       where task_id=$1
+       order by sequence_id desc nulls last, created_at desc, id desc
+       limit 100`,
+      [taskId],
+    );
+  } catch {
+    eventsRes = await queryFn(
+      `select event_type,message,payload,metadata,created_at
+       from hermes_task_events
+       where task_id=$1
+       order by created_at desc, id desc
+       limit 100`,
+      [taskId],
+    );
+  }
+  const events = eventsRes.rows || [];
+  const candidate = events.find((event) => event.event_type === 'skill_lesson_candidate') || null;
+  return { task, candidate, events };
+}
+
+async function buildSkillLearnReviewMessage(taskId, options = {}) {
+  const { task, candidate, events } = await getSkillLessonReview(taskId, options);
+  if (!task) return `Không tìm thấy task #${taskId}.`;
+  if (!candidate) return `No skill_lesson_candidate found for task #${taskId}. Use /events ${taskId} to inspect task history.`;
+  const eventSummary = summarizeSkillEvents(events);
+  const lesson = truncateForTelegram(extractLessonCandidateText(candidate), 900);
+  return [
+    `Skill lesson review for task #${task.id}`,
+    `- Status: ${task.status}`,
+    `- Input: ${truncateForTelegram(task.input_text, 500)}`,
+    `- Selected skills: ${eventSummary.selectedSkills.length ? eventSummary.selectedSkills.join(', ') : '-'}`,
+    `- Missing env: ${eventSummary.missingEnv.length ? eventSummary.missingEnv.join(', ') : '-'}`,
+    `- Missing tools: ${eventSummary.missingTools.length ? eventSummary.missingTools.join(', ') : '-'}`,
+    `Potential lesson to save: ${lesson}`,
+    `Next step: /skills save-memory ${task.id} or /skills append-skill ${task.id} <skill-name>`,
+  ].join("\n");
+}
+
+async function saveSkillLessonToMemory(taskId, options = {}) {
+  const queryFn = options.queryFn || query;
+  const { task, candidate } = await getSkillLessonReview(taskId, { queryFn });
+  if (!task) return { ok: false, message: `Không tìm thấy task #${taskId}.` };
+  if (!candidate) return { ok: false, message: `No skill_lesson_candidate found for task #${taskId}. Nothing saved.` };
+  const lesson = redactSensitiveText(extractLessonCandidateText(candidate));
+  if (!lesson.trim()) return { ok: false, message: `Skill lesson candidate for task #${taskId} is empty. Nothing saved.` };
+  const memoryKey = `skill_lesson:task:${task.id}`;
+  const memoryRes = await queryFn(
+    `insert into hermes_memories (memory_key,memory_text,source,trust_score,memory_type,importance,confidence,last_used_at)
+     values ($1,$2,$3,$4,$5,$6,$7,now())
+     returning id,memory_key,memory_text,memory_type`,
+    [memoryKey, lesson, 'skill_layer_v3_reviewed', 0.7, 'ops_sop', 3, 0.7],
+  );
+  await queryFn(
+    `insert into hermes_task_events (task_id,event_type,message,payload)
+     values ($1,$2,$3,$4::jsonb)`,
+    [task.id, 'skill_lesson_saved_to_memory', 'Reviewed skill lesson saved to hermes_memories', JSON.stringify({ memory_key: memoryKey, memory_id: memoryRes.rows[0]?.id || null })],
+  );
+  return { ok: true, memory: memoryRes.rows[0] || { memory_key: memoryKey, memory_text: lesson, memory_type: 'ops_sop' } };
+}
+
+async function buildSkillSaveMemoryMessage(taskId, options = {}) {
+  const saved = await saveSkillLessonToMemory(taskId, options);
+  if (!saved.ok) return saved.message;
+  return [
+    `Skill lesson saved to memory ✅`,
+    `- Task: #${taskId}`,
+    `- Memory: ${saved.memory.id || saved.memory.memory_key || '-'}`,
+    `- Type: ${saved.memory.memory_type || 'ops_sop'}`,
+    `- Text: ${truncateForTelegram(saved.memory.memory_text, 500)}`,
+  ].join("\n");
+}
+
+async function buildSkillsCommandReply(text, options = {}) {
   const input = String(text || "").trim();
   if (/^\/skills(?:@\w+)?\s+list$/i.test(input) || /^\/skills(?:@\w+)?$/i.test(input)) {
     return `Curated Hermes Skill Pack v2\n\n${formatSkillsList()}\n\nRouting: classify intent → match top 1-3 skills → check env/tools → load selected SKILL.md only → plan → require approval for risky/prod actions → execute → verify → save lessons.`;
@@ -714,11 +819,22 @@ async function buildSkillsCommandReply(text) {
 
   if (/^\/skills(?:@\w+)?\s+doctor$/i.test(input)) return formatSkillDoctor();
 
-  const learnMatch = input.match(/^\/skills(?:@\w+)?\s+learn(?:\s+([\s\S]+))?$/i);
-  if (learnMatch) return "Skill learning is not implemented yet in Skill Layer v2. Use /task <id> to inspect lesson candidates.";
+  const learnMatch = input.match(/^\/skills(?:@\w+)?\s+learn(?:\s+(\d+))?$/i);
+  if (learnMatch) {
+    const taskId = Number(learnMatch[1]);
+    if (!Number.isInteger(taskId) || taskId <= 0) return "Dùng: /skills learn <task_id>";
+    return buildSkillLearnReviewMessage(taskId, options);
+  }
+
+  const saveMemoryMatch = input.match(/^\/skills(?:@\w+)?\s+save-memory(?:\s+(\d+))?$/i);
+  if (saveMemoryMatch) {
+    const taskId = Number(saveMemoryMatch[1]);
+    if (!Number.isInteger(taskId) || taskId <= 0) return "Dùng: /skills save-memory <task_id>";
+    return buildSkillSaveMemoryMessage(taskId, options);
+  }
 
   const match = input.match(/^\/skills(?:@\w+)?\s+match\s+([\s\S]+)$/i);
-  if (!match) return "Dùng: /skills list | show <name> | why <task> | match <task> | doctor | learn <task_id>";
+  if (!match) return "Dùng: /skills list | show <name> | why <task> | match <task> | doctor | learn <task_id> | save-memory <task_id>";
 
   const queryText = match[1].trim();
   if (!queryText) return "Dùng: /skills match <task>";
@@ -731,7 +847,10 @@ async function buildSkillsCommandReply(text) {
 
 function redactSensitiveText(value) {
   return String(value || "")
-    .replace(/(token|apikey|api_key|authorization|password|bearer|secret)\s*[:=]?\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s:/?#]+:[^\s@/?#]+@/g, (match) => match.replace(/:\/\/[^\s:/?#]+:[^\s@/?#]+@/, "://[REDACTED]@"))
+    .replace(/\b(?:DATABASE_URL|database_url)\s*[:=]\s*[^\s,;]+/gi, "DATABASE_URL=[REDACTED]")
+    .replace(/\b(?:sk|pk|ghp|gho|glpat|xoxb|xoxp)-[A-Za-z0-9_\-]{12,}\b/g, "[REDACTED_API_KEY]")
+    .replace(/(token|apikey|api_key|authorization|password|bearer|secret|client_secret|access_key)\s*[:=]?\s*[^\s,;]+/gi, "$1=[REDACTED]")
     .replace(/postgres(?:ql)?:\/\/[^\s@]+@/gi, "postgres://[REDACTED]@");
 }
 
@@ -883,6 +1002,144 @@ async function buildQueueMessage() {
     `- worker: ${health.worker?.alive ? "alive" : "unknown"}${workerAge !== "-" ? ` (${workerAge} ago)` : ""}`,
     ...healthWarnings.map((w) => `- warning: ${truncateForTelegram(w, 140)}`),
   ].join("\n");
+}
+
+
+function taskAgeSeconds(task, nowMs = Date.now()) {
+  return Math.floor((nowMs - new Date(task.created_at).getTime()) / 1000);
+}
+
+function isTaskStale(task, nowMs = Date.now()) {
+  const ageSeconds = taskAgeSeconds(task, nowMs);
+  if (task.status === 'pending') return ageSeconds > 24 * 3600;
+  if (task.status === 'approved') return ageSeconds > 24 * 3600;
+  if (task.status === 'running') return ageSeconds > 30 * 60;
+  if (task.status === 'pending_approval') {
+    if (task.approval_expires_at && new Date(task.approval_expires_at).getTime() < nowMs) return true;
+    return ageSeconds > 24 * 3600;
+  }
+  return false;
+}
+
+function formatStaleTaskRow(task, nowMs = Date.now()) {
+  const ageSeconds = Number.isFinite(Number(task.age_seconds)) ? Number(task.age_seconds) : taskAgeSeconds(task, nowMs);
+  return `#${task.id} ${task.status} age=${formatAge(ageSeconds)} — ${truncateForTelegram(task.input_text, 90)} | created=${formatIso(task.created_at)}${task.approval_expires_at ? ` | approval_expires=${formatIso(task.approval_expires_at)}` : ''}`;
+}
+
+async function fetchStaleTasks(options = {}) {
+  const queryFn = options.queryFn || query;
+  const res = await queryFn(
+    `select id,status,input_text,created_at,approval_expires_at,
+            extract(epoch from (now() - created_at))::int as age_seconds
+     from hermes_tasks
+     where (status='pending' and created_at < now() - interval '24 hours')
+        or (status='approved' and created_at < now() - interval '24 hours')
+        or (status='running' and created_at < now() - interval '30 minutes')
+        or (status='pending_approval' and (approval_expires_at < now() or (approval_expires_at is null and created_at < now() - interval '24 hours')))
+     order by created_at asc
+     limit $1`,
+    [options.limit || 25],
+  );
+  return res.rows || [];
+}
+
+async function buildTasksStaleMessage(options = {}) {
+  const rows = await fetchStaleTasks(options);
+  if (!rows.length) return 'No stale pending/pending_approval/approved/running tasks found.';
+  return ['Stale tasks (read-only):', ...rows.map((task) => `- ${formatStaleTaskRow(task, options.nowMs)}`)].join('\n');
+}
+
+async function expireStaleTasks(options = {}) {
+  if (!options.operatorAuthorized) {
+    return { ok: false, message: 'Operator authorization required for /tasks expire-stale.' };
+  }
+  const queryFn = options.queryFn || query;
+  const stale = await fetchStaleTasks({ ...options, queryFn, limit: options.limit || 100 });
+  const eligible = stale.filter((task) => task.status === 'pending_approval');
+  const expired = [];
+  const skipped = stale.filter((task) => task.status !== 'pending_approval').map((task) => ({ id: task.id, status: task.status, reason: 'not_expired_in_v3_fsm_guard' }));
+  for (const task of eligible) {
+    const updated = await queryFn(
+      `update hermes_tasks
+       set status='failed', error_text=$2, updated_at=now()
+       where id=$1 and status='pending_approval'
+       returning id,status`,
+      [task.id, 'Expired by operator stale-task cleanup'],
+    );
+    if ((updated.rowCount || 0) !== 1) continue;
+    expired.push(task.id);
+    await queryFn(
+      `insert into hermes_task_events (task_id,event_type,message,payload)
+       values ($1,$2,$3,$4::jsonb)`,
+      [task.id, 'stale_task_expired', 'Expired by operator stale-task cleanup', JSON.stringify({ previous_status: task.status, new_status: 'failed' })],
+    );
+    await queryFn(
+      `insert into hermes_task_events (task_id,event_type,message,payload)
+       values ($1,$2,$3,$4::jsonb)`,
+      [task.id, 'status_transition', 'pending_approval -> failed', JSON.stringify({ reason: 'Expired by operator stale-task cleanup' })],
+    );
+  }
+  return { ok: true, expired, skipped };
+}
+
+async function buildTasksExpireStaleMessage(options = {}) {
+  const result = await expireStaleTasks(options);
+  if (!result.ok) return result.message;
+  const lines = [
+    `Expired stale tasks: ${result.expired.length}`,
+    `- ids: ${result.expired.length ? result.expired.join(', ') : '-'}`,
+  ];
+  if (result.skipped.length) {
+    lines.push(`- skipped by v3 FSM guard: ${result.skipped.map((s) => `#${s.id} ${s.status}`).join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+async function buildTasksSummaryMessage(options = {}) {
+  const queryFn = options.queryFn || query;
+  const summary = await queryFn(
+    `select
+       coalesce(sum(case when status='pending' then 1 else 0 end),0)::int as pending,
+       coalesce(sum(case when status='pending_approval' then 1 else 0 end),0)::int as pending_approval,
+       coalesce(sum(case when status='approved' then 1 else 0 end),0)::int as approved,
+       coalesce(sum(case when status='running' then 1 else 0 end),0)::int as running,
+       coalesce(sum(case when status='completed' and updated_at > now() - interval '24 hours' then 1 else 0 end),0)::int as completed_24h,
+       coalesce(sum(case when status='failed' and updated_at > now() - interval '24 hours' then 1 else 0 end),0)::int as failed_24h,
+       coalesce(extract(epoch from (now() - min(case when status='pending' then created_at end)))::int,0) as oldest_pending_age_seconds,
+       coalesce(sum(case when status='pending' and created_at < now() - interval '24 hours' then 1 else 0 end),0)::int as stale_pending,
+       coalesce(sum(case when status='pending_approval' and (approval_expires_at < now() or (approval_expires_at is null and created_at < now() - interval '24 hours')) then 1 else 0 end),0)::int as stale_pending_approval,
+       coalesce(sum(case when status='approved' and created_at < now() - interval '24 hours' then 1 else 0 end),0)::int as stale_approved,
+       coalesce(sum(case when status='running' and created_at < now() - interval '30 minutes' then 1 else 0 end),0)::int as stale_running
+     from hermes_tasks`,
+  );
+  const row = summary.rows[0] || {};
+  return [
+    'Tasks summary',
+    `- pending: ${row.pending || 0}`,
+    `- pending_approval: ${row.pending_approval || 0}`,
+    `- approved: ${row.approved || 0}`,
+    `- running: ${row.running || 0}`,
+    `- completed_24h: ${row.completed_24h || 0}`,
+    `- failed_24h: ${row.failed_24h || 0}`,
+    `- oldest pending age: ${formatAge(row.oldest_pending_age_seconds)}`,
+    `- stale pending: ${row.stale_pending || 0}`,
+    `- stale pending_approval: ${row.stale_pending_approval || 0}`,
+    `- stale approved: ${row.stale_approved || 0}`,
+    `- stale running: ${row.stale_running || 0}`,
+  ].join('\n');
+}
+
+async function buildTasksCommandReply(text, options = {}) {
+  const input = String(text || '').trim();
+  if (/^\/tasks(?:@\w+)?\s+stale$/i.test(input)) return buildTasksStaleMessage(options);
+  if (/^\/tasks(?:@\w+)?\s+summary$/i.test(input)) return buildTasksSummaryMessage(options);
+  if (/^\/tasks(?:@\w+)?\s+expire-stale$/i.test(input)) {
+    const operatorAuthorized = Object.prototype.hasOwnProperty.call(options, 'operatorAuthorized')
+      ? options.operatorAuthorized
+      : isAllowed(options.userId);
+    return buildTasksExpireStaleMessage({ ...options, operatorAuthorized });
+  }
+  return 'Dùng: /tasks stale | /tasks summary | /tasks expire-stale';
 }
 
 async function buildTelegramTaskMessage(text) {
@@ -1622,7 +1879,7 @@ if (callback) {
       }
 
 
-      if (normalized === "/skills" || normalized === "/skills list" || normalized.startsWith("/skills match ") || normalized.startsWith("/skills show ") || normalized.startsWith("/skills why ") || normalized === "/skills doctor" || normalized.startsWith("/skills learn")) {
+      if (normalized === "/skills" || normalized === "/skills list" || normalized.startsWith("/skills match ") || normalized.startsWith("/skills show ") || normalized.startsWith("/skills why ") || normalized === "/skills doctor" || normalized.startsWith("/skills learn") || normalized.startsWith("/skills save-memory")) {
         try {
           await sendTelegramMessage(chatId, await buildSkillsCommandReply(text));
         } catch (err) {
@@ -1711,6 +1968,16 @@ if (callback) {
         continue;
       }
 
+      if (normalized === "/tasks" || normalized.startsWith("/tasks ")) {
+        try {
+          await sendTelegramMessage(chatId, await buildTasksCommandReply(text, { userId }));
+        } catch (err) {
+          await sendTelegramMessage(chatId, `Lỗi /tasks: ${truncateForTelegram(err.message, 200)}`);
+        }
+        console.log("COMMAND_HANDLED /tasks", { userId, chatId });
+        continue;
+      }
+
       if (normalized === "/memory stats") {
         try {
           await sendTelegramMessage(chatId, await buildMemoryStatsMessage());
@@ -1793,8 +2060,9 @@ if (callback) {
 
 /status — system health
 /queue — queue summary
+/tasks summary|stale|expire-stale — task hygiene
 /pending — pending approvals
-/skills list|match <task> — curated Hermes Skill Pack v1
+/skills list|match|learn|save-memory — curated Hermes Skill Pack v3
 /task <id> — task details
 /events <id> — task event timeline
 /approve <id> — approve pending task
@@ -2527,6 +2795,16 @@ module.exports = {
   app,
   createTask,
   logSkillUsageForTask,
+  buildSkillsCommandReply,
+  buildSkillLearnReviewMessage,
+  saveSkillLessonToMemory,
+  buildSkillSaveMemoryMessage,
+  buildTasksCommandReply,
+  buildTasksStaleMessage,
+  expireStaleTasks,
+  buildTasksExpireStaleMessage,
+  buildTasksSummaryMessage,
+  isTaskStale,
   isCasualTelegramInput,
   isTaskLikeTelegramInput,
 };
