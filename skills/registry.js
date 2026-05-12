@@ -311,12 +311,104 @@ function buildSkillContext(queryText, options = {}) {
   }
   const full = parts.length ? `Skill Context\n${parts.join("\n\n")}` : "";
   const truncated = full.length > maxChars;
+  const text = truncated ? `${full.slice(0, maxChars)}\n[Skill Context truncated]` : full;
   return {
     selectedSkills: selected.map((skill) => ({ name: skill.name, score: skill.score })),
     loadedCustomSkillPaths,
-    text: truncated ? `${full.slice(0, maxChars)}\n[Skill Context truncated]` : full,
+    text,
     truncated,
+    totalSkillContextChars: text.length,
   };
+}
+
+function skillSelectionMetadata(selected) {
+  return selected.map((skill) => ({
+    name: skill.name,
+    score: skill.score,
+    category: skill.category,
+    matched_keywords: skill.matchedKeywords || [],
+    workflow_boost_labels: skill.boosts || [],
+  }));
+}
+
+function skillRequirementsMetadata(selected, env = process.env) {
+  const skills = selected.map((skill) => {
+    const req = checkSkillRequirements(skill, env);
+    return {
+      name: skill.name,
+      satisfied: req.ok,
+      missing_env: req.missingEnv,
+      missing_tools: req.missingTools,
+      host_operator_required_tools: req.hostOperatorTools,
+      tool_statuses: (req.toolStatuses || []).map((tool) => ({
+        tool: tool.tool,
+        kind: tool.kind,
+        status: tool.status,
+        available_in_container: tool.availableInContainer,
+      })),
+    };
+  });
+  return {
+    satisfied: skills.every((skill) => skill.satisfied),
+    missing_env: [...new Set(skills.flatMap((skill) => skill.missing_env || []))],
+    missing_tools: [...new Set(skills.flatMap((skill) => skill.missing_tools || []))],
+    host_operator_required_tools: [...new Set(skills.flatMap((skill) => skill.host_operator_required_tools || []))],
+    skills,
+  };
+}
+
+function buildSkillUsageEvents(queryText, options = {}) {
+  if (/^\/skills(?:\s+(?:why|show|doctor|list|match)\b|\s*$)/i.test(String(queryText || "").trim())) {
+    return [];
+  }
+  const routed = classifyTelegramSkillIntent(queryText);
+  if (routed.intent === "small_talk") return [];
+  const selected = matchSkills(queryText, options.limit || 3);
+  if (!selected.length) return [];
+
+  const selectedSkills = skillSelectionMetadata(selected);
+  const requirements = skillRequirementsMetadata(selected, options.env || process.env);
+  const context = buildSkillContext(queryText, options);
+  const selectedSkillNames = selectedSkills.map((skill) => skill.name);
+  const events = [
+    {
+      event_type: "skills_matched",
+      message: "Skills matched for task planning",
+      metadata: { selected_skills: selectedSkills },
+    },
+    {
+      event_type: "skill_requirements_checked",
+      message: "Skill requirements checked",
+      metadata: { selected_skill_names: selectedSkillNames, ...requirements },
+    },
+  ];
+
+  if (context.loadedCustomSkillPaths.length) {
+    events.push({
+      event_type: "skill_loaded",
+      message: "Custom skill context loaded",
+      metadata: {
+        loaded_custom_skill_paths: context.loadedCustomSkillPaths,
+        selected_skill_names: selectedSkillNames,
+        truncated: context.truncated,
+        total_skill_context_chars: context.totalSkillContextChars,
+      },
+    });
+  }
+
+  if (context.text) {
+    events.push({
+      event_type: "skill_context_attached",
+      message: "Skill context attached to planning context",
+      metadata: {
+        attached_skill_names: selectedSkillNames,
+        truncated: context.truncated,
+        char_count: context.totalSkillContextChars,
+      },
+    });
+  }
+
+  return events;
 }
 
 function getSkillDoctor(options = {}) {
@@ -365,6 +457,7 @@ module.exports = {
   classifyTelegramSkillIntent,
   loadCustomSkillMarkdown,
   buildSkillContext,
+  buildSkillUsageEvents,
   closestSkillNames,
   formatSkillsList,
   formatSkillMatches,

@@ -1,7 +1,11 @@
+process.env.PROJECT_ROOT_PROD = process.env.PROJECT_ROOT_PROD || '/tmp/hermes-prod-root-for-tests';
+process.env.DISABLE_TELEGRAM = 'true';
+
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   buildSkillContext,
+  buildSkillUsageEvents,
   checkSkillRequirements,
   formatSkillDoctor,
   formatSkillShow,
@@ -69,14 +73,77 @@ test('/skills why formatter is lightweight and task-free', () => {
   assert.doesNotMatch(output, /Task created from Telegram/);
 });
 
-test('real task planning code emits skill usage events', () => {
-  const source = require('node:fs').readFileSync(require('node:path').join(process.cwd(), 'index.js'), 'utf8');
-  for (const eventName of ['skills_matched', 'skill_requirements_checked', 'skill_loaded', 'skill_missing_requirements', 'skill_context_attached']) {
-    assert.match(source, new RegExp(eventName));
-  }
+test('simulated real Telegram task writes Skill Layer v2 events with metadata', async () => {
+  const { logSkillUsageForTask } = require('../index');
+  const writes = [];
+  await logSkillUsageForTask(24, 'fix docker compose postgres deploy issue skill event smoke', {
+    env: { DATABASE_URL: 'postgres://secret-value-should-not-appear' },
+    queryFn: async (sql, params) => {
+      writes.push({ sql, params, metadata: JSON.parse(params[3]) });
+      return { rows: [], rowCount: 1 };
+    },
+  });
+
+  const eventTypes = writes.map((write) => write.params[1]);
+  assert.deepEqual(eventTypes, ['skills_matched', 'skill_requirements_checked', 'skill_loaded', 'skill_context_attached']);
+  assert.ok(writes.every((write) => /payload, metadata/.test(write.sql)));
+
+  const matched = writes.find((write) => write.params[1] === 'skills_matched').metadata;
+  assert.ok(matched.selected_skills.some((skill) => skill.name === 'docker-compose-v1-safety'));
+  assert.ok(matched.selected_skills.every((skill) => Number.isFinite(skill.score)));
+  assert.ok(matched.selected_skills.every((skill) => skill.category));
+  assert.ok(matched.selected_skills.some((skill) => skill.matched_keywords.includes('docker') || skill.matched_keywords.includes('postgres')));
+  assert.ok(matched.selected_skills.some((skill) => skill.workflow_boost_labels.length));
+
+  const requirements = writes.find((write) => write.params[1] === 'skill_requirements_checked').metadata;
+  assert.equal(typeof requirements.satisfied, 'boolean');
+  assert.ok(Array.isArray(requirements.missing_env));
+  assert.ok(Array.isArray(requirements.missing_tools));
+  assert.ok(requirements.host_operator_required_tools.includes('docker'));
+  assert.ok(requirements.skills.every((skill) => typeof skill.satisfied === 'boolean'));
+
+  const loaded = writes.find((write) => write.params[1] === 'skill_loaded').metadata;
+  assert.ok(loaded.loaded_custom_skill_paths.every((skillPath) => /skills\/custom\/.+\/SKILL\.md$/.test(skillPath)));
+  assert.ok(loaded.selected_skill_names.includes('docker-compose-v1-safety'));
+  assert.equal(typeof loaded.truncated, 'boolean');
+  assert.ok(loaded.total_skill_context_chars > 0);
+
+  const attached = writes.find((write) => write.params[1] === 'skill_context_attached').metadata;
+  assert.ok(attached.attached_skill_names.includes('docker-compose-v1-safety'));
+  assert.equal(typeof attached.truncated, 'boolean');
+  assert.ok(attached.char_count > 0);
 });
 
-test('small-talk still bypasses skill matching/heavy flow', () => {
+test('/skills why remains task-free and does not write task events', async () => {
+  const { logSkillUsageForTask } = require('../index');
+  const writes = [];
+  await logSkillUsageForTask(26, '/skills why fix docker compose postgres deploy issue', { queryFn: async (...args) => writes.push(args) });
+  const output = formatSkillWhy('fix docker compose postgres deploy issue');
+  assert.match(output, /Skill match explanation/);
+  assert.doesNotMatch(output, /Task created from Telegram/);
+  assert.doesNotMatch(output, /hermes_tasks/);
+  assert.deepEqual(writes, []);
+  assert.equal(typeof logSkillUsageForTask, 'function');
+});
+
+test('small-talk does not write skill events', async () => {
   const { classifyTelegramSkillIntent } = require('../skills/registry');
+  const { logSkillUsageForTask } = require('../index');
+  const writes = [];
   assert.deepEqual(classifyTelegramSkillIntent('Hi'), { intent: 'small_talk', skills: [] });
+  await logSkillUsageForTask(25, 'Hi', { queryFn: async (...args) => writes.push(args) });
+  assert.deepEqual(writes, []);
+});
+
+test('skill event metadata redacts env values and includes only env names', () => {
+  const events = buildSkillUsageEvents('somewhere payment payos admin webhook', {
+    env: { PAYOS_CLIENT_ID: 'client-secret-value' },
+  });
+  const serialized = JSON.stringify(events);
+  assert.doesNotMatch(serialized, /client-secret-value/);
+  assert.doesNotMatch(serialized, /postgres:\/\//);
+  const requirements = events.find((event) => event.event_type === 'skill_requirements_checked').metadata;
+  assert.ok(requirements.missing_env.includes('PAYOS_API_KEY'));
+  assert.ok(requirements.missing_env.includes('PAYOS_CHECKSUM_KEY'));
+  assert.ok(!requirements.missing_env.includes('client-secret-value'));
 });
