@@ -173,17 +173,6 @@ function checkSkillRequirements(skill, env = process.env) {
   };
 }
 
-function buildSkillContext(queryText, options = {}) {
-  const skills = matchSkills(queryText, options.limit || 3);
-  return {
-    input: String(queryText || ''),
-    skills: skills.map((skill) => ({
-      ...skill,
-      requirements: checkSkillRequirements(skill, options.env || process.env),
-    })),
-  };
-}
-
 function classifyTelegramSkillIntent(text) {
   const normalized = String(text || "").trim().toLowerCase();
   if (!normalized || ["hi", "hello", "hey", "chào", "chao", "alo", "ok", "ping", "test"].includes(normalized)) {
@@ -302,6 +291,10 @@ function buildSkillContext(queryText, options = {}) {
   const rootDir = options.rootDir || process.cwd();
   const maxChars = options.maxChars || SKILL_CONTEXT_MAX_CHARS;
   const selected = matchSkills(queryText, options.limit || 3);
+  const skills = selected.map((skill) => ({
+    ...skill,
+    requirements: checkSkillRequirements(skill, options.env || process.env),
+  }));
   const loadedCustomSkillPaths = [];
   const parts = [];
   for (const skill of selected) {
@@ -324,6 +317,8 @@ function buildSkillContext(queryText, options = {}) {
   const truncated = full.length > maxChars;
   const text = truncated ? `${full.slice(0, maxChars)}\n[Skill Context truncated]` : full;
   return {
+    input: String(queryText || ""),
+    skills,
     selectedSkills: selected.map((skill) => ({ name: skill.name, score: skill.score })),
     loadedCustomSkillPaths,
     text,
@@ -468,7 +463,6 @@ module.exports = {
   buildSkillContext,
   classifyTelegramSkillIntent,
   loadCustomSkillMarkdown,
-  buildSkillContext,
   buildSkillUsageEvents,
   closestSkillNames,
   formatSkillsList,
