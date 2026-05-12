@@ -17,9 +17,16 @@ const { createPlanForTask, taskType } = require('./dispatcher/planner');
 const { executePlan } = require('./dispatcher/executor');
 const { runDueGoals } = require('./dispatcher/goalRunner');
 const { runGoalTask } = require("./dispatcher/goals");
-const { handleExternalCliTask, approvedExternalActionsFromSnapshot } = require("./dispatcher/externalCliTools");
-const { buildSkillContext, matchSkills, checkSkillRequirements } = require("./skills/registry");
-
+const {
+  handleExternalCliTask,
+  approvedExternalActionsFromSnapshot,
+} = require("./dispatcher/externalCliTools");
+const {
+  buildSkillContext,
+  matchSkills,
+  checkSkillRequirements,
+  buildSkillUsageEvents,
+} = require("./skills/registry");
 
 const rawExecAsync = promisify(exec);
 const { canonicalizeApprovalSnapshot, hashApprovalSnapshot } = require('./approvalSnapshot');
@@ -162,28 +169,9 @@ async function persistBlockedApprovalFailure(task, safeError, approvalStatus) {
 async function attachSkillContextForWorker(task) {
   const selected = matchSkills(task.input_text || '', 3);
   if (!selected.length) return null;
-  const selectedSkills = selected.map((skill) => ({ name: skill.name, score: skill.score }));
-  const requirementDetails = selected.map((skill) => {
-    const req = checkSkillRequirements(skill, process.env);
-    return {
-      name: skill.name,
-      missingEnv: req.missingEnv,
-      missingTools: req.missingTools,
-      hostOperatorTools: req.hostOperatorTools,
-      ok: req.ok,
-    };
-  });
   const context = buildSkillContext(task.input_text || '', { limit: 3 });
-  await event(task.id, 'skills_matched', 'Worker matched skills for planning', { selected_skills: selectedSkills });
-  await event(task.id, 'skill_requirements_checked', 'Worker checked skill requirements', { selected_skills: selectedSkills, requirements: requirementDetails, missing_env: [...new Set(requirementDetails.flatMap((r) => r.missingEnv || []))], missing_tools: [...new Set(requirementDetails.flatMap((r) => r.missingTools || []))] });
-  if (requirementDetails.some((r) => (r.missingEnv || []).length || (r.missingTools || []).length)) {
-    await event(task.id, 'skill_missing_requirements', 'Skill requirements missing or operator-only', { selected_skills: selectedSkills, missing_env: [...new Set(requirementDetails.flatMap((r) => r.missingEnv || []))], missing_tools: [...new Set(requirementDetails.flatMap((r) => r.missingTools || []))] });
-  }
-  if (context.loadedCustomSkillPaths.length) {
-    await event(task.id, 'skill_loaded', 'Custom skill files loaded for planning', { selected_skills: selectedSkills, loaded_custom_skill_paths: context.loadedCustomSkillPaths });
-  }
-  if (context.text) {
-    await event(task.id, 'skill_context_attached', 'Skill context attached to planner', { selected_skills: selectedSkills, loaded_custom_skill_paths: context.loadedCustomSkillPaths, truncated: context.truncated });
+  for (const skillEvent of buildSkillUsageEvents(task.input_text || '', { limit: 3 })) {
+    await event(task.id, skillEvent.event_type, `Worker ${skillEvent.message.charAt(0).toLowerCase()}${skillEvent.message.slice(1)}`, skillEvent.metadata);
   }
   return context;
 }

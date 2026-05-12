@@ -33,9 +33,12 @@ async function createPlanForTask(task) {
   }
   if (task.skill_context) {
     await query(
-      `insert into hermes_task_events (task_id, event_type, message, payload)
-       values ($1, 'skill_context_attached', $2, $3)`,
-      [task.id, 'Skill Context available to planner', { truncated: task.skill_context.includes('[Skill Context truncated]') }]
+      `insert into hermes_task_events (task_id, event_type, message, payload, metadata)
+       values ($1, 'skill_context_attached', $2, $3, $3)`,
+      [task.id, 'Skill Context available to planner', {
+        truncated: task.skill_context.includes('[Skill Context truncated]'),
+        char_count: String(task.skill_context || '').length,
+      }]
     );
   }
   console.log('PLAN_CREATED', { taskId: task.id, planId: plan.id });

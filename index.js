@@ -14,6 +14,7 @@ const {
   matchSkills,
   checkSkillRequirements,
   buildSkillContext,
+  buildSkillUsageEvents,
 } = require("./skills/registry");
 const {
   ensureGBrainSchema,
@@ -989,50 +990,18 @@ function isAllowed(userId) {
 }
 
 
-async function logSkillUsageForTask(taskId, text) {
-  const routed = classifyTelegramSkillIntent(text);
-  if (routed.intent === "small_talk") return;
-  const selected = matchSkills(text, 3);
-  if (!selected.length) return;
-  const selectedSkills = selected.map((skill) => ({ name: skill.name, score: skill.score }));
-  const requirementDetails = selected.map((skill) => {
-    const req = checkSkillRequirements(skill, process.env);
-    return {
-      name: skill.name,
-      missingEnv: req.missingEnv,
-      missingTools: req.missingTools,
-      hostOperatorTools: req.hostOperatorTools,
-      toolStatuses: (req.toolStatuses || []).map((tool) => ({ tool: tool.tool, kind: tool.kind, status: tool.status, availableInContainer: tool.availableInContainer })),
-      ok: req.ok,
-    };
+async function logSkillUsageForTask(taskId, text, options = {}) {
+  const events = buildSkillUsageEvents(text, {
+    env: options.env || process.env,
+    rootDir: options.rootDir || process.cwd(),
+    limit: 3,
   });
-  const missingEnv = [...new Set(requirementDetails.flatMap((item) => item.missingEnv || []))];
-  const missingTools = [...new Set(requirementDetails.flatMap((item) => item.missingTools || []))];
-  const context = buildSkillContext(text, { limit: 3 });
-  await query(
-    `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skills_matched', $2, $3)`,
-    [taskId, 'Skills matched for task planning', { selected_skills: selectedSkills }]
-  );
-  await query(
-    `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skill_requirements_checked', $2, $3)`,
-    [taskId, 'Skill requirements checked', { selected_skills: selectedSkills, requirements: requirementDetails, missing_env: missingEnv, missing_tools: missingTools }]
-  );
-  if (missingEnv.length || missingTools.length) {
-    await query(
-      `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skill_missing_requirements', $2, $3)`,
-      [taskId, 'Skill requirements missing or operator-only', { selected_skills: selectedSkills, missing_env: missingEnv, missing_tools: missingTools }]
-    );
-  }
-  if (context.loadedCustomSkillPaths.length) {
-    await query(
-      `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skill_loaded', $2, $3)`,
-      [taskId, 'Custom skill context loaded', { selected_skills: selectedSkills, loaded_custom_skill_paths: context.loadedCustomSkillPaths }]
-    );
-  }
-  if (context.text) {
-    await query(
-      `insert into hermes_task_events (task_id, event_type, message, payload) values ($1, 'skill_context_attached', $2, $3)`,
-      [taskId, 'Skill context attached to planning context', { selected_skills: selectedSkills, loaded_custom_skill_paths: context.loadedCustomSkillPaths, truncated: context.truncated }]
+  const queryFn = options.queryFn || query;
+  for (const event of events) {
+    await queryFn(
+      `insert into hermes_task_events (task_id, event_type, message, payload, metadata)
+       values ($1, $2, $3, $4::jsonb, $4::jsonb)`,
+      [taskId, event.event_type, event.message, JSON.stringify(event.metadata || {})]
     );
   }
 }
@@ -1101,12 +1070,12 @@ async function createTask(chatId, userId, text, options = {}) {
      values ($1, 'created', $2)`,
     [taskId, "Task created from Telegram"]
   );
+  await logSkillUsageForTask(taskId, text);
   await query(
     `insert into hermes_task_events (task_id, event_type, message)
      values ($1, 'planned', $2)`,
     [taskId, "Task moved to planned"]
   );
-  await logSkillUsageForTask(taskId, text);
   const plannedToPending = await query(
     `update hermes_tasks
      set status='pending_approval',
@@ -1481,9 +1450,11 @@ app.get("/", (req, res) => {
   res.send("Hermes v5 Lite App Running 🚀");
 });
 
-ensureGBrainSchema()
-  .then(() => console.log("GBrain schema ready 🧠"))
-  .catch((err) => console.error("GBrain schema error:", err.message));
+if (require.main === module) {
+  ensureGBrainSchema()
+    .then(() => console.log("GBrain schema ready 🧠"))
+    .catch((err) => console.error("GBrain schema error:", err.message));
+}
 
 async function pollTelegram() {
   try {
@@ -2538,14 +2509,24 @@ async function sendAutoReport() {
   }
 }
 
-setInterval(() => {
-  sendAutoReport().catch((err) =>
-    console.error("Auto report error:", err.message)
-  );
-}, 60 * 1000);
+if (require.main === module) {
+  setInterval(() => {
+    sendAutoReport().catch((err) =>
+      console.error("Auto report error:", err.message)
+    );
+  }, 60 * 1000);
 
-pollTelegram();
+  pollTelegram();
 
-app.listen(3000, () => {
-  console.log("Hermes app running on port 3000");
-});
+  app.listen(3000, () => {
+    console.log("Hermes app running on port 3000");
+  });
+}
+
+module.exports = {
+  app,
+  createTask,
+  logSkillUsageForTask,
+  isCasualTelegramInput,
+  isTaskLikeTelegramInput,
+};
