@@ -1073,11 +1073,6 @@ async function expireStaleTasks(options = {}) {
        values ($1,$2,$3,$4::jsonb)`,
       [task.id, 'stale_task_expired', 'Expired by operator stale-task cleanup', JSON.stringify({ previous_status: task.status, new_status: 'failed' })],
     );
-    await queryFn(
-      `insert into hermes_task_events (task_id,event_type,message,payload)
-       values ($1,$2,$3,$4::jsonb)`,
-      [task.id, 'status_transition', 'pending_approval -> failed', JSON.stringify({ reason: 'Expired by operator stale-task cleanup' })],
-    );
   }
   return { ok: true, expired, skipped };
 }

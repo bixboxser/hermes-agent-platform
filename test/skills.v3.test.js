@@ -107,7 +107,27 @@ test('/tasks expire-stale mutates only eligible stale pending_approval tasks and
   assert.deepEqual(result.expired, [2]);
   assert.deepEqual(result.skipped.map((task) => task.id), [1, 3, 4]);
   assert.equal(writes.filter((write) => /update hermes_tasks/.test(write.sql)).length, 1);
-  assert.deepEqual(writes.filter((write) => /insert into hermes_task_events/.test(write.sql)).map((write) => write.params[1]), ['stale_task_expired', 'status_transition']);
+  const eventWrites = writes.filter((write) => /insert into hermes_task_events/.test(write.sql));
+  assert.deepEqual(eventWrites.map((write) => write.params[1]), ['stale_task_expired']);
+  assert.equal(eventWrites.filter((write) => write.params[1] === 'stale_task_expired').length, 1);
+  assert.equal(eventWrites.filter((write) => write.params[1] === 'status_transition').length, 0);
+});
+
+test('/tasks expire-stale relies on the DB trigger for one pending_approval -> failed status_transition', async () => {
+  const writes = [];
+  await expireStaleTasks({
+    operatorAuthorized: true,
+    queryFn: async (sql, params) => {
+      if (/select id,status,input_text/.test(sql)) return { rows: [staleRows[1]], rowCount: 1 };
+      writes.push({ sql, params });
+      if (/update hermes_tasks/.test(sql)) return { rows: [{ id: 2, status: 'failed' }], rowCount: 1 };
+      if (/insert into hermes_task_events/.test(sql)) return { rows: [], rowCount: 1 };
+      throw new Error(`unexpected sql: ${sql}`);
+    },
+  });
+
+  const manualStatusTransitionWrites = writes.filter((write) => /insert into hermes_task_events/.test(write.sql) && write.params[1] === 'status_transition');
+  assert.equal(manualStatusTransitionWrites.length, 0);
 });
 
 test('/tasks summary returns queue and stale counts', async () => {
